@@ -44,17 +44,21 @@ type Poller interface {
 
 // IssueEvent is the normalized issue event emitted by all adapters.
 type IssueEvent struct {
-	Action    string // "created", "updated"
-	IssueID   string // Adapter-specific ID (issue key, number, GID, etc.)
-	Title     string
-	Body      string
-	Labels    []string
-	ProjectID string
+	Action     string // "created", "updated"
+	IssueID    string // Adapter-specific primary ID (UUID, GID, node ID, etc.)
+	SequenceID string // Human-readable number/key within the project (e.g. "42" for Plane, "PROJ-42" for Jira). Used in branch names and PR descriptions. Empty when the adapter has no such concept.
+	Title      string
+	Body       string
+	Labels     []string
+	Priority   string // Normalized priority: "urgent", "high", "medium", "low", "none", or "" if the adapter has no priority concept.
+	ProjectID  string
 }
 
 // IssueResult is the normalized result from processing an issue.
 type IssueResult struct {
 	Success    bool
+	Skipped    bool   // true when the handler decided not to process the issue
+	SkipReason string // reason constant from sdk/util/skipreason; populated when Skipped is true
 	PRNumber   int
 	PRURL      string
 	HeadSHA    string
