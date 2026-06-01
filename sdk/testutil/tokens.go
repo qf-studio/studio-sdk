@@ -4,4 +4,7 @@ package testutil
 
 const (
 	FakePlaneAPIKey = "test-plane-api-key"
+
+	FakeGitLabToken         = "test-gitlab-token"
+	FakeGitLabWebhookSecret = "test-gitlab-webhook-secret"
 )
