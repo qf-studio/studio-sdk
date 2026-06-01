@@ -7,4 +7,7 @@ const (
 
 	FakeGitLabToken         = "test-gitlab-token"
 	FakeGitLabWebhookSecret = "test-gitlab-webhook-secret"
+
+	FakeAzureDevOpsPAT           = "test-azure-devops-pat"
+	FakeAzureDevOpsWebhookSecret = "test-azure-devops-webhook-secret"
 )
