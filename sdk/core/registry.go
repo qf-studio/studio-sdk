@@ -109,6 +109,16 @@ type ProcessedStore interface {
 	Load(source, repo string) (map[string]time.Time, error)
 }
 
+// ActiveExecutionLister reports the task IDs of executions that are currently
+// active, so stale-branch / stale-label cleanup never removes a branch or label
+// an execution is still using. Consuming applications implement this against
+// their own execution store; the SDK never constructs it.
+type ActiveExecutionLister interface {
+	// ListActiveTaskIDs returns the task IDs (e.g. "GL-123", "AZ-456") of
+	// executions currently in flight.
+	ListActiveTaskIDs(ctx context.Context) ([]string, error)
+}
+
 // PollerDeps provides shared infrastructure to adapter pollers. Consuming
 // applications supply these — the SDK never constructs them itself.
 type PollerDeps struct {

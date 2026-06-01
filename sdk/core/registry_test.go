@@ -65,6 +65,23 @@ func TestIssueHandlerFunc(t *testing.T) {
 	}
 }
 
+type stubLister struct{ ids []string }
+
+func (s stubLister) ListActiveTaskIDs(_ context.Context) ([]string, error) { return s.ids, nil }
+
+func TestActiveExecutionLister(t *testing.T) {
+	var _ ActiveExecutionLister = stubLister{}
+
+	lister := stubLister{ids: []string{"GL-42", "GL-99"}}
+	got, err := lister.ListActiveTaskIDs(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(got) != 2 || got[0] != "GL-42" || got[1] != "GL-99" {
+		t.Fatalf("ListActiveTaskIDs = %v, want [GL-42 GL-99]", got)
+	}
+}
+
 func TestIssueResultSkipped(t *testing.T) {
 	var h IssueHandler = IssueHandlerFunc(func(_ context.Context, _ IssueEvent) (*IssueResult, error) {
 		return &IssueResult{Skipped: true, SkipReason: "in_progress"}, nil
