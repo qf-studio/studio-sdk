@@ -1,0 +1,319 @@
+package jira
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text"
+)
+
+// WebhookEventType represents the type of webhook event.
+type WebhookEventType string
+
+const (
+	EventIssueCreated WebhookEventType = "jira:issue_created"
+	EventIssueUpdated WebhookEventType = "jira:issue_updated"
+	EventIssueDeleted WebhookEventType = "jira:issue_deleted"
+	EventCommentAdded WebhookEventType = "comment_created"
+)
+
+// WebhookPayload represents a Jira webhook payload.
+type WebhookPayload struct {
+	WebhookEvent string     `json:"webhookEvent"`
+	Timestamp    int64      `json:"timestamp"`
+	User         *User      `json:"user,omitempty"`
+	Issue        *Issue     `json:"issue,omitempty"`
+	Changelog    *Changelog `json:"changelog,omitempty"`
+	Comment      *Comment   `json:"comment,omitempty"`
+}
+
+// Changelog represents changes in a webhook event.
+type Changelog struct {
+	ID    string          `json:"id"`
+	Items []ChangelogItem `json:"items"`
+}
+
+// ChangelogItem represents a single change in the changelog.
+type ChangelogItem struct {
+	Field      string `json:"field"`
+	FieldType  string `json:"fieldtype"`
+	From       string `json:"from"`
+	FromString string `json:"fromString"`
+	To         string `json:"to"`
+	ToString   string `json:"toString"`
+}
+
+// WebhookHandler handles Jira webhooks.
+type WebhookHandler struct {
+	client        *Client
+	logger        *slog.Logger
+	webhookSecret string
+	triggerLabel  string
+	onIssue       func(context.Context, *Issue) error
+}
+
+// NewWebhookHandler creates a new webhook handler.
+func NewWebhookHandler(client *Client, webhookSecret, triggerLabel string, opts ...Option) *WebhookHandler {
+	cfg := &loggerConfig{logger: slog.Default()}
+	for _, o := range opts {
+		o(cfg)
+	}
+	return &WebhookHandler{
+		client:        client,
+		logger:        cfg.logger,
+		webhookSecret: webhookSecret,
+		triggerLabel:  triggerLabel,
+	}
+}
+
+// OnIssue sets the callback for when a trigger-labeled issue is received.
+func (h *WebhookHandler) OnIssue(callback func(context.Context, *Issue) error) {
+	h.onIssue = callback
+}
+
+// VerifySignature verifies the Jira webhook HMAC-SHA256 signature.
+// Returns true when no secret is configured (development mode).
+func (h *WebhookHandler) VerifySignature(payload []byte, signature string) bool {
+	if h.webhookSecret == "" {
+		return true
+	}
+
+	mac := hmac.New(sha256.New, []byte(h.webhookSecret))
+	mac.Write(payload)
+	expectedSig := hex.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(signature), []byte(expectedSig))
+}
+
+// Handle processes a webhook payload.
+func (h *WebhookHandler) Handle(ctx context.Context, payload map[string]interface{}) error {
+	webhookEvent, _ := payload["webhookEvent"].(string)
+
+	h.logger.Debug("Jira webhook", slog.String("event", webhookEvent))
+
+	switch webhookEvent {
+	case string(EventIssueCreated):
+		return h.handleIssueCreated(ctx, payload)
+	case string(EventIssueUpdated):
+		return h.handleIssueUpdated(ctx, payload)
+	default:
+		h.logger.Debug("ignoring Jira event", slog.String("event", webhookEvent))
+		return nil
+	}
+}
+
+// handleIssueCreated processes newly created issues.
+func (h *WebhookHandler) handleIssueCreated(ctx context.Context, payload map[string]interface{}) error {
+	issue, err := h.extractIssue(payload)
+	if err != nil {
+		return err
+	}
+
+	if !h.hasTriggerLabel(issue) {
+		h.logger.Debug("issue does not have trigger label, skipping", slog.String("key", issue.Key))
+		return nil
+	}
+
+	return h.processIssue(ctx, issue)
+}
+
+// handleIssueUpdated processes issue updates (check for label additions).
+func (h *WebhookHandler) handleIssueUpdated(ctx context.Context, payload map[string]interface{}) error {
+	if !h.wasLabelAdded(payload) {
+		return nil
+	}
+
+	issue, err := h.extractIssue(payload)
+	if err != nil {
+		return err
+	}
+
+	if !h.hasTriggerLabel(issue) {
+		h.logger.Debug("issue does not have trigger label, skipping", slog.String("key", issue.Key))
+		return nil
+	}
+
+	return h.processIssue(ctx, issue)
+}
+
+// processIssue processes an issue that should be handled.
+func (h *WebhookHandler) processIssue(ctx context.Context, issue *Issue) error {
+	h.logger.Info("processing trigger-labeled issue", slog.String("key", issue.Key), slog.String("summary", issue.Fields.Summary))
+
+	// Fetch full issue details via API (webhook payload may be incomplete).
+	fullIssue, err := h.client.GetIssue(ctx, issue.Key)
+	if err != nil {
+		return fmt.Errorf("failed to fetch issue details: %w", err)
+	}
+
+	// Sanitize untrusted fields on the fully-fetched issue before dispatch.
+	sanitizeIssueInPlace(fullIssue, h.logger)
+
+	if h.onIssue != nil {
+		return h.onIssue(ctx, fullIssue)
+	}
+
+	return nil
+}
+
+// extractIssue extracts and sanitizes issue data from the webhook payload.
+//
+// Untrusted text coming off the wire is sanitized before being stored on the
+// canonical Issue struct so that every downstream consumer sees the cleaned
+// form (defense against ASCII-smuggling / invisible-Unicode prompt injection).
+func (h *WebhookHandler) extractIssue(payload map[string]interface{}) (*Issue, error) {
+	issueData, ok := payload["issue"].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("missing issue in payload")
+	}
+
+	issue := &Issue{}
+
+	if key, ok := issueData["key"].(string); ok {
+		issue.Key = key
+	}
+	if id, ok := issueData["id"].(string); ok {
+		issue.ID = id
+	}
+	if self, ok := issueData["self"].(string); ok {
+		issue.Self = self
+	}
+
+	var summaryStripped, descStripped int
+	if fieldsData, ok := issueData["fields"].(map[string]interface{}); ok {
+		if summary, ok := fieldsData["summary"].(string); ok {
+			issue.Fields.Summary, summaryStripped = text.SanitizeUntrusted(summary)
+		}
+		if desc, ok := fieldsData["description"].(string); ok {
+			issue.Fields.Description, descStripped = text.SanitizeUntrusted(desc)
+		}
+		// Also handle ADF description (Jira Cloud).
+		if desc, ok := fieldsData["description"].(map[string]interface{}); ok {
+			issue.Fields.Description, descStripped = text.SanitizeUntrusted(h.extractADFText(desc))
+		}
+		if summaryStripped+descStripped > 0 {
+			h.logger.Warn(
+				"invisible_unicode_stripped",
+				slog.String("source", "jira-webhook"),
+				slog.String("issue", issue.Key),
+				slog.Int("summary_stripped", summaryStripped),
+				slog.Int("description_stripped", descStripped),
+			)
+		}
+
+		if labels, ok := fieldsData["labels"].([]interface{}); ok {
+			for _, l := range labels {
+				if label, ok := l.(string); ok {
+					issue.Fields.Labels = append(issue.Fields.Labels, label)
+				}
+			}
+		}
+
+		if issueType, ok := fieldsData["issuetype"].(map[string]interface{}); ok {
+			if name, ok := issueType["name"].(string); ok {
+				issue.Fields.IssueType.Name = name
+			}
+		}
+
+		if status, ok := fieldsData["status"].(map[string]interface{}); ok {
+			if name, ok := status["name"].(string); ok {
+				issue.Fields.Status.Name = name
+			}
+		}
+
+		if priority, ok := fieldsData["priority"].(map[string]interface{}); ok {
+			issue.Fields.Priority = &JiraPriority{}
+			if name, ok := priority["name"].(string); ok {
+				issue.Fields.Priority.Name = name
+			}
+		}
+
+		if project, ok := fieldsData["project"].(map[string]interface{}); ok {
+			if key, ok := project["key"].(string); ok {
+				issue.Fields.Project.Key = key
+			}
+			if name, ok := project["name"].(string); ok {
+				issue.Fields.Project.Name = name
+			}
+		}
+	}
+
+	return issue, nil
+}
+
+// extractADFText extracts plain text from Atlassian Document Format.
+func (h *WebhookHandler) extractADFText(adf map[string]interface{}) string {
+	var sb strings.Builder
+	h.extractADFTextRecursive(adf, &sb)
+	return strings.TrimSpace(sb.String())
+}
+
+// extractADFTextRecursive recursively extracts text from ADF nodes.
+func (h *WebhookHandler) extractADFTextRecursive(node map[string]interface{}, sb *strings.Builder) {
+	if t, ok := node["text"].(string); ok {
+		sb.WriteString(t)
+	}
+
+	if content, ok := node["content"].([]interface{}); ok {
+		for _, item := range content {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				h.extractADFTextRecursive(itemMap, sb)
+			}
+		}
+		if nodeType, ok := node["type"].(string); ok {
+			if nodeType == "paragraph" || nodeType == "heading" || nodeType == "listItem" {
+				sb.WriteString("\n")
+			}
+		}
+	}
+}
+
+// hasTriggerLabel checks if the issue has the trigger label (case-insensitive).
+func (h *WebhookHandler) hasTriggerLabel(issue *Issue) bool {
+	for _, label := range issue.Fields.Labels {
+		if strings.EqualFold(label, h.triggerLabel) {
+			return true
+		}
+	}
+	return false
+}
+
+// wasLabelAdded checks if the trigger label was added in this update.
+func (h *WebhookHandler) wasLabelAdded(payload map[string]interface{}) bool {
+	changelog, ok := payload["changelog"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+
+	items, ok := changelog["items"].([]interface{})
+	if !ok {
+		return false
+	}
+
+	for _, item := range items {
+		itemMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		field, _ := itemMap["field"].(string)
+		if field != "labels" {
+			continue
+		}
+
+		toString, _ := itemMap["toString"].(string)
+		if strings.Contains(strings.ToLower(toString), strings.ToLower(h.triggerLabel)) {
+			fromString, _ := itemMap["fromString"].(string)
+			if !strings.Contains(strings.ToLower(fromString), strings.ToLower(h.triggerLabel)) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
