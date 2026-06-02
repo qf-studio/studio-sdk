@@ -21,4 +21,8 @@ const (
 	FakeJiraWebhookSecret = "test-jira-webhook-secret"
 	FakeJiraUsername      = "test-jira-username"
 	FakeJiraAPIToken      = "test-jira-api-token"
+
+	FakeAsanaToken         = "test-asana-token"
+	FakeAsanaWebhookSecret = "test-asana-webhook-secret"
+	FakeAsanaWorkspaceID   = "test-asana-workspace-id"
 )
