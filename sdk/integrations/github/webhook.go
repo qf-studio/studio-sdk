@@ -185,6 +185,12 @@ func (h *WebhookHandler) processIssue(ctx context.Context, issue *Issue, repo *R
 		return fmt.Errorf("failed to fetch issue details: %w", err)
 	}
 
+	// Sanitize untrusted issue text in the live path before any host consumer
+	// sees it. The webhook is one of two entry points (the other is the poller)
+	// where third-party text crosses into the SDK; core.IssueEvent must never
+	// carry raw title/body. See sanitizeIssueInPlace (converter.go).
+	sanitizeIssueInPlace(h.logger, fullIssue)
+
 	// Call the callback
 	if h.onIssue != nil {
 		return h.onIssue(ctx, fullIssue, repo)
