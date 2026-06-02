@@ -5,7 +5,12 @@
 **Driver:** Pilot drives studio-sdk via the GH Project board "Studio SDK"
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
-**Current tag:** `v0.9.0` (origin/main, `a0108a1`).
+**Current tag:** `v0.11.0` (origin/main, `6a9ec9f`) — github connector complete.
+**Releases are daemon-automated:** the Pilot daemon auto-tags a release on every
+merge to main (`release: version_strategy: conventional_commits, tag_prefix: v`
+in `~/.pilot/config.yaml`) → one minor bump *per merged PR*, as lightweight tags.
+The driver loop does NOT `git tag`; we add annotated GitHub Releases with
+changelogs on top of the daemon's tags. So each connector consumes ~2 minors.
 **Local checkout:** reconciled to `origin/main` (`a9af2dd`) on 2026-06-02. The
 prior diverged local fork (`455842e`, which had reworked `ActiveExecutionLister`
 to `ActiveBranches` and stripped `ExecutionMode`/`MergeWaiter`/metrics tests)
@@ -32,29 +37,32 @@ work below.
   push-protected tests.
 - `Makefile` (`build`/`test`/`lint`/`fmt`/`tidy`) + `sdk/doc.go`.
 
-### Connectors extracted (3 / 10)
+### Connectors extracted (4 / 10)
 | Connector | Milestone | Commits / PRs |
 | --------- | --------- | ------------- |
 | `plane`        | M1   | `12f4f82`, PR #10 |
 | `gitlab`       | M2.2 | `2bb4f67` (PR #19), `e41ab23` (PR #21) |
 | `azuredevops`  | M2.3 | `d2086e1` (PR #23), `a9af2dd` (PR #25) |
+| `github`       | M3   | PR #30 (#28, v0.10.0), PR #31 (#29, v0.11.0) |
 
-All three: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
+All four: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
 
-### GitHub connector (M3) — IN FLIGHT (2026-06-02)
-First connector with a non-stdlib dep (`go-github`) → `go.mod`/`go.sum` appear
-in the repo for the first time; `make tidy` + commit both before tagging.
-Triaged the Pilot adapter (29 files): **port** `client`/`types`/`converter`/
-`notifier`/`webhook`/`retry`/`approval_config` then `poller`/`merger`/`cleanup`/
-`adapter`; **drop** `grouping`/`issue_create`/`project_board`/`spec_validator`
-(Pilot-domain — epic refs, `CreatePilotIssue`, board status flips, spec marker).
+### GitHub connector (M3) — SHIPPED (2026-06-02, v0.11.0)
+Stdlib-only after all (uses `net/http`, **no** `go-github` dep — the expected
+external dep never materialized; `go.mod` stays require-less, no `go.sum`).
+**Ported:** `client`/`types`/`converter`/`notifier`/`webhook`/`retry`/
+`approval_config` (#28) then `poller`/`merger`/`cleanup`/`adapter` (#29).
+**Dropped** (Pilot-domain): `grouping`/`issue_create`/`project_board`/
+`spec_validator`.
 
-| Issue | Scope | Labels | State |
-| --- | --- | --- | --- |
-| #28 | client/data (+retry, approval_config) | `pilot,no-decompose` | **In Progress** (daemon) |
-| #29 | poller/merger/cleanup/adapter | `backlog,no-decompose` | held at `NONE`, behind #28 |
+| Issue | Scope | PR | Release | Notes |
+| --- | --- | --- | --- | --- |
+| #28 | client/data (+retry, approval_config) | #30 | v0.10.0 | reviewer patched a missing webhook sanitize call before merge |
+| #29 | poller/merger/cleanup/adapter | #31 | v0.11.0 | daemon stalled before push; commit `56eb419` recovered + pushed manually; gofmt fixup |
 
-Dispatch via the board per [driving-the-sdk-board](../sops/development/driving-the-sdk-board.md).
+Both reviewed against the gates (sanitize wired in live poll/webhook paths,
+contract assertions, no pilot imports). Dispatch via the board per
+[driving-the-sdk-board](../sops/development/driving-the-sdk-board.md).
 
 ### Invariant verification (local)
 - `grep -rn "qf-studio/pilot" sdk/` → no matches.
@@ -87,11 +95,10 @@ Applied across all 3 connectors in one pass:
 
 ## What remains
 
-### Connectors NOT yet extracted (6 / 10)
+### Connectors NOT yet extracted (5 / 10)
 Still in Pilot at `internal/adapters/`:
 
-- `github`     ← **IN FLIGHT** (M3, #28/#29 — see above)
-- `linear`
+- `linear`    ← **NEXT** (M4 — issue-tracker quartet, mechanical recipe reuse)
 - `jira`
 - `asana`
 - `slack`     ← chat — *unproven shape*; doesn't fit issue-poller mold
