@@ -5,7 +5,7 @@
 **Driver:** Pilot drives studio-sdk via the GH Project board "Studio SDK"
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
-**Current tag:** `v0.8.0` (origin/main).
+**Current tag:** `v0.9.0` (origin/main, `a0108a1`).
 **Local checkout:** reconciled to `origin/main` (`a9af2dd`) on 2026-06-02. The
 prior diverged local fork (`455842e`, which had reworked `ActiveExecutionLister`
 to `ActiveBranches` and stripped `ExecutionMode`/`MergeWaiter`/metrics tests)
@@ -46,8 +46,10 @@ All three: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
 - Connectors implement `sdk/core` contracts; loggers injected; only stdlib deps
   in core / util / testutil.
 
-### Surface neutralization + security fix (2026-06-02, branch `refactor/sdk-neutralize-prompt-layer`)
-Applied across all 3 connectors in one pass (see PR):
+### Surface neutralization + security fix (2026-06-02 — MERGED PR #26, released `v0.9.0`)
+Branch `refactor/sdk-neutralize-prompt-layer` rebase-merged to `main` (`a0108a1`),
+tagged `v0.9.0` (annotation carries the contract/behavior/security changelog).
+Applied across all 3 connectors in one pass:
 - **Removed host-domain prompt layer** (`TaskInfo`, `Convert*ToTask`,
   `BuildTaskPrompt`, `ExtractAcceptanceCriteria`, `PriorityName`) — the SDK now
   emits only normalized `core.IssueEvent`; the host builds prompts.
