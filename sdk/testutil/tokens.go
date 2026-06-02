@@ -13,4 +13,7 @@ const (
 
 	FakeGitHubToken         = "test-github-token"
 	FakeGitHubWebhookSecret = "test-github-webhook-secret"
+
+	FakeLinearToken         = "test-linear-token"
+	FakeLinearWebhookSecret = "test-linear-webhook-secret"
 )
