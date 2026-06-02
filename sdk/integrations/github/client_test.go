@@ -1227,7 +1227,7 @@ func TestDefaultConfig(t *testing.T) {
 	}
 
 	if cfg.TriggerLabel != "pilot" {
-		t.Errorf("default PilotLabel = %s, want 'pilot'", cfg.TriggerLabel)
+		t.Errorf("default TriggerLabel = %s, want 'pilot'", cfg.TriggerLabel)
 	}
 
 	if cfg.Polling == nil {
