@@ -16,4 +16,7 @@ const (
 
 	FakeLinearToken         = "test-linear-token"
 	FakeLinearWebhookSecret = "test-linear-webhook-secret"
+
+	FakeJiraToken         = "test-jira-token"
+	FakeJiraWebhookSecret = "test-jira-webhook-secret"
 )
