@@ -1,0 +1,1316 @@
+package github
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/core"
+	"github.com/qf-studio/studio-sdk/sdk/util/skipreason"
+	"github.com/qf-studio/studio-sdk/sdk/util/text"
+)
+
+// ExecutionMode determines how issues are processed.
+type ExecutionMode string
+
+const (
+	// ExecutionModeSequential processes one issue at a time, waiting for PR merge.
+	ExecutionModeSequential ExecutionMode = "sequential"
+	// ExecutionModeParallel processes issues concurrently.
+	ExecutionModeParallel ExecutionMode = "parallel"
+	// ExecutionModeAuto uses parallel dispatch with scope-overlap guard:
+	// non-overlapping issues run concurrently; overlapping groups run oldest-first.
+	ExecutionModeAuto ExecutionMode = "auto"
+)
+
+// IssueResult is returned by the issue handler with PR information.
+type IssueResult struct {
+	Success    bool
+	PRNumber   int
+	PRURL      string
+	HeadSHA    string
+	BranchName string
+	Error      error
+}
+
+// Poller polls GitHub for issues with a specific label.
+type Poller struct {
+	client    *Client
+	owner     string
+	repo      string
+	label     string
+	interval  time.Duration
+	processed map[int]time.Time
+	mu        sync.RWMutex
+
+	onIssue           func(ctx context.Context, issue *Issue) error
+	onIssueWithResult func(ctx context.Context, issue *Issue) (*IssueResult, error)
+	// OnPRCreated is called when a PR is created after issue processing.
+	// Parameters: prNumber, prURL, issueNumber, headSHA, branchName, issueNodeID.
+	OnPRCreated func(prNumber int, prURL string, issueNumber int, headSHA string, branchName string, issueNodeID string)
+
+	logger *slog.Logger
+
+	executionMode  ExecutionMode
+	mergeWaiter    *MergeWaiter
+	waitForMerge   bool
+	prTimeout      time.Duration
+	prPollInterval time.Duration
+
+	maxConcurrent int
+	semaphore     chan struct{}
+	activeWg      sync.WaitGroup
+	stopping      atomic.Bool
+	wgMu          sync.Mutex
+
+	processedStore core.ProcessedStore
+
+	// retryGracePeriod prevents rapid re-dispatch of recently-processed issues.
+	retryGracePeriod time.Duration
+
+	failedRetryCount map[int]int
+	maxFailedRetries int
+
+	retryReadyCount      map[int]int
+	maxRetryReadyRetries int
+
+	pollerMetrics skipreason.PollerMetricsRecorder
+}
+
+// PollerOption configures a Poller.
+type PollerOption func(*Poller)
+
+// WithPollerLogger sets the logger for the poller.
+func WithPollerLogger(logger *slog.Logger) PollerOption {
+	return func(p *Poller) { p.logger = logger }
+}
+
+// WithOnIssue sets the callback for new issues (parallel mode).
+func WithOnIssue(fn func(ctx context.Context, issue *Issue) error) PollerOption {
+	return func(p *Poller) { p.onIssue = fn }
+}
+
+// WithOnIssueWithResult sets the callback for new issues that returns PR info.
+func WithOnIssueWithResult(fn func(ctx context.Context, issue *Issue) (*IssueResult, error)) PollerOption {
+	return func(p *Poller) { p.onIssueWithResult = fn }
+}
+
+// WithExecutionMode sets the execution mode.
+func WithExecutionMode(mode ExecutionMode) PollerOption {
+	return func(p *Poller) { p.executionMode = mode }
+}
+
+// WithSequentialConfig configures sequential execution settings.
+func WithSequentialConfig(waitForMerge bool, pollInterval, timeout time.Duration) PollerOption {
+	return func(p *Poller) {
+		p.waitForMerge = waitForMerge
+		p.prPollInterval = pollInterval
+		p.prTimeout = timeout
+	}
+}
+
+// WithOnPRCreated sets the callback for PR creation events.
+// Parameters: prNumber, prURL, issueNumber, headSHA, branchName, issueNodeID.
+func WithOnPRCreated(fn func(prNumber int, prURL string, issueNumber int, headSHA string, branchName string, issueNodeID string)) PollerOption {
+	return func(p *Poller) { p.OnPRCreated = fn }
+}
+
+// WithProcessedStore sets the persistent store for processed issue tracking.
+func WithProcessedStore(store core.ProcessedStore) PollerOption {
+	return func(p *Poller) { p.processedStore = store }
+}
+
+// WithRetryGracePeriod sets the minimum time before a processed issue can be re-dispatched.
+func WithRetryGracePeriod(d time.Duration) PollerOption {
+	return func(p *Poller) { p.retryGracePeriod = d }
+}
+
+// WithMaxFailedRetries sets the maximum number of auto-retries for pilot-failed issues.
+func WithMaxFailedRetries(n int) PollerOption {
+	return func(p *Poller) {
+		if n < 0 {
+			n = 0
+		}
+		p.maxFailedRetries = n
+	}
+}
+
+// WithMaxRetryReadyRetries sets the maximum number of auto-retries for pilot-retry-ready issues.
+func WithMaxRetryReadyRetries(n int) PollerOption {
+	return func(p *Poller) {
+		if n < 0 {
+			n = 0
+		}
+		p.maxRetryReadyRetries = n
+	}
+}
+
+// WithMaxConcurrent sets the maximum number of parallel issue executions.
+func WithMaxConcurrent(n int) PollerOption {
+	return func(p *Poller) {
+		if n < 1 {
+			n = 1
+		}
+		p.maxConcurrent = n
+	}
+}
+
+// WithPollerMetrics sets the recorder for per-repo dispatch/skip counters.
+func WithPollerMetrics(rec skipreason.PollerMetricsRecorder) PollerOption {
+	return func(p *Poller) { p.pollerMetrics = rec }
+}
+
+// NewPoller creates a new GitHub issue poller.
+// repo must be in "owner/repo" format.
+func NewPoller(client *Client, repo string, label string, interval time.Duration, opts ...PollerOption) (*Poller, error) {
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid repo format, expected owner/repo: %s", repo)
+	}
+
+	p := &Poller{
+		client:               client,
+		owner:                parts[0],
+		repo:                 parts[1],
+		label:                label,
+		interval:             interval,
+		processed:            make(map[int]time.Time),
+		logger:               slog.Default(),
+		executionMode:        ExecutionModeAuto,
+		waitForMerge:         true,
+		prPollInterval:       30 * time.Second,
+		prTimeout:            1 * time.Hour,
+		retryGracePeriod:     5 * time.Minute,
+		failedRetryCount:     make(map[int]int),
+		maxFailedRetries:     3,
+		retryReadyCount:      make(map[int]int),
+		maxRetryReadyRetries: 3,
+	}
+
+	for _, opt := range opts {
+		opt(p)
+	}
+
+	if p.executionMode == ExecutionModeSequential && p.waitForMerge {
+		p.mergeWaiter = NewMergeWaiter(client, p.owner, p.repo, &MergeWaiterConfig{
+			PollInterval: p.prPollInterval,
+			Timeout:      p.prTimeout,
+		})
+	}
+
+	if p.processedStore != nil {
+		loaded, err := p.processedStore.Load("github", p.repoKey())
+		if err != nil {
+			p.logger.Warn("Failed to load processed issues from store", slog.Any("error", err))
+		} else if len(loaded) > 0 {
+			p.mu.Lock()
+			for idStr, t := range loaded {
+				if num, parseErr := strconv.Atoi(idStr); parseErr == nil {
+					p.processed[num] = t
+				}
+			}
+			p.mu.Unlock()
+			p.logger.Info("Loaded processed issues from store", slog.Int("count", len(loaded)))
+		}
+	}
+
+	if p.maxConcurrent < 1 {
+		p.maxConcurrent = 2
+	}
+	p.semaphore = make(chan struct{}, p.maxConcurrent)
+
+	return p, nil
+}
+
+// Start begins polling for issues. Implements core.Poller.
+func (p *Poller) Start(ctx context.Context) error {
+	p.logger.Info("Starting GitHub poller",
+		slog.String("repo", p.owner+"/"+p.repo),
+		slog.String("label", p.label),
+		slog.Duration("interval", p.interval),
+		slog.String("mode", string(p.executionMode)),
+	)
+
+	p.recoverOrphanedIssues(ctx)
+
+	if p.executionMode == ExecutionModeSequential {
+		p.startSequential(ctx)
+	} else {
+		p.startParallel(ctx)
+	}
+	return nil
+}
+
+func (p *Poller) recoverOrphanedIssues(ctx context.Context) {
+	issues, err := p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
+		Labels: []string{p.label, LabelInProgress},
+		State:  StateOpen,
+	})
+	if err != nil {
+		p.logger.Warn("Failed to check for orphaned issues", slog.Any("error", err))
+		return
+	}
+
+	if len(issues) == 0 {
+		return
+	}
+
+	p.logger.Info("Recovering orphaned in-progress issues", slog.Int("count", len(issues)))
+
+	for _, issue := range issues {
+		if err := p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, LabelInProgress); err != nil {
+			p.logger.Warn("Failed to remove in-progress label from orphaned issue",
+				slog.Int("number", issue.Number),
+				slog.Any("error", err),
+			)
+			continue
+		}
+		p.unmarkProcessed(issue.Number)
+		p.logger.Info("Recovered orphaned issue",
+			slog.Int("number", issue.Number),
+			slog.String("title", issue.Title),
+		)
+	}
+}
+
+func (p *Poller) startParallel(ctx context.Context) {
+	p.logger.Info("Running in parallel mode",
+		slog.String("mode", string(p.executionMode)),
+		slog.Int("max_concurrent", p.maxConcurrent),
+	)
+
+	p.checkForNewIssues(ctx)
+
+	ticker := time.NewTicker(p.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			p.logger.Info("Parallel poller stopping, waiting for active tasks...")
+			p.wgMu.Lock()
+			p.stopping.Store(true)
+			p.wgMu.Unlock()
+			p.activeWg.Wait()
+			p.logger.Info("Parallel poller stopped")
+			return
+		case <-ticker.C:
+			p.checkForNewIssues(ctx)
+		}
+	}
+}
+
+func (p *Poller) startSequential(ctx context.Context) {
+	p.logger.Info("Running in sequential mode",
+		slog.Bool("wait_for_merge", p.waitForMerge),
+		slog.Duration("pr_timeout", p.prTimeout),
+	)
+
+	for {
+		select {
+		case <-ctx.Done():
+			p.logger.Info("Sequential poller stopped")
+			return
+		default:
+		}
+
+		issue, err := p.findOldestUnprocessedIssue(ctx)
+		if err != nil {
+			p.logger.Warn("Failed to find issues", slog.Any("error", err))
+			time.Sleep(p.interval)
+			continue
+		}
+
+		if issue == nil {
+			p.logger.Debug("No unprocessed issues found, waiting...")
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(p.interval):
+				continue
+			}
+		}
+
+		p.logger.Info("Processing issue in sequential mode",
+			slog.Int("number", issue.Number),
+			slog.String("title", issue.Title),
+		)
+
+		result, err := p.processIssueSequential(ctx, issue)
+		if err != nil {
+			p.logger.Error("Failed to process issue",
+				slog.Int("number", issue.Number),
+				slog.Any("error", err),
+			)
+			continue
+		}
+
+		if result != nil && result.PRNumber > 0 && p.OnPRCreated != nil {
+			p.logger.Info("Notifying of PR creation",
+				slog.Int("pr_number", result.PRNumber),
+				slog.Int("issue_number", issue.Number),
+				slog.String("branch", result.BranchName),
+			)
+			p.OnPRCreated(result.PRNumber, result.PRURL, issue.Number, result.HeadSHA, result.BranchName, issue.NodeID)
+		}
+
+		if result != nil && result.PRNumber > 0 && p.waitForMerge && p.mergeWaiter != nil {
+			p.logger.Info("Waiting for PR merge before next issue",
+				slog.Int("pr_number", result.PRNumber),
+				slog.String("pr_url", result.PRURL),
+			)
+
+			mergeResult, err := p.mergeWaiter.WaitWithCallback(ctx, result.PRNumber, func(r *MergeWaitResult) {
+				p.logger.Debug("PR status check",
+					slog.Int("pr_number", r.PRNumber),
+					slog.String("status", r.Message),
+				)
+			})
+
+			if err != nil {
+				p.logger.Warn("Error waiting for PR merge, pausing sequential processing",
+					slog.Int("pr_number", result.PRNumber),
+					slog.Any("error", err),
+				)
+				time.Sleep(5 * time.Minute)
+				continue
+			}
+
+			p.logger.Info("PR merge wait completed",
+				slog.Int("pr_number", result.PRNumber),
+				slog.Bool("merged", mergeResult.Merged),
+				slog.Bool("closed", mergeResult.Closed),
+				slog.Bool("conflicting", mergeResult.Conflicting),
+				slog.Bool("timed_out", mergeResult.TimedOut),
+			)
+
+			if mergeResult.Conflicting {
+				p.logger.Warn("PR has conflicts, pausing sequential processing",
+					slog.Int("pr_number", result.PRNumber),
+				)
+				time.Sleep(5 * time.Minute)
+				continue
+			}
+
+			if mergeResult.TimedOut {
+				p.logger.Warn("PR merge timed out, pausing sequential processing",
+					slog.Int("pr_number", result.PRNumber),
+				)
+				time.Sleep(5 * time.Minute)
+				continue
+			}
+
+			if mergeResult.Merged {
+				p.markProcessed(issue.Number)
+				continue
+			}
+
+			if mergeResult.Closed {
+				p.logger.Info("PR was closed without merge", slog.Int("pr_number", result.PRNumber))
+				continue
+			}
+		}
+
+		if result != nil && result.Success && result.PRNumber == 0 {
+			p.logger.Info("Direct commit completed, proceeding to next issue",
+				slog.Int("issue_number", issue.Number),
+				slog.String("commit_sha", result.HeadSHA),
+			)
+			p.markProcessed(issue.Number)
+			continue
+		}
+
+		if result != nil && !result.Success && result.PRNumber == 0 {
+			p.logger.Info("Execution failed without PR, not marking as processed (retryable)",
+				slog.Int("issue_number", issue.Number),
+			)
+			continue
+		}
+
+		p.markProcessed(issue.Number)
+	}
+}
+
+func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error) {
+	issues, err := p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
+		Labels: []string{p.label},
+		State:  StateOpen,
+		Sort:   "created",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	var candidates []*Issue
+	for _, issue := range issues {
+		if issue.PullRequest != nil {
+			continue
+		}
+
+		if HasLabel(issue, LabelInProgress) || HasLabel(issue, LabelDone) {
+			continue
+		}
+
+		if HasLabel(issue, LabelBlocked) {
+			continue
+		}
+
+		if HasLabel(issue, LabelNeedsClarification) {
+			continue
+		}
+
+		if p.skipSupersededByParent(ctx, issue) {
+			continue
+		}
+
+		if HasLabel(issue, LabelFailed) {
+			if !p.shouldRetryFailedIssue(ctx, issue) {
+				continue
+			}
+		}
+
+		if HasLabel(issue, LabelRetryReady) {
+			if !p.shouldRetryRetryReadyIssue(ctx, issue) {
+				continue
+			}
+		}
+
+		p.mu.RLock()
+		processedAt, processed := p.processed[issue.Number]
+		p.mu.RUnlock()
+
+		if processed {
+			if p.retryGracePeriod > 0 && time.Since(processedAt) < p.retryGracePeriod {
+				p.logger.Debug("Issue within retry grace period, skipping",
+					slog.Int("number", issue.Number),
+					slog.Duration("elapsed", time.Since(processedAt)),
+					slog.Duration("grace_period", p.retryGracePeriod))
+				continue
+			}
+
+			p.logger.Info("Issue was processed but status labels removed, allowing retry",
+				slog.Int("number", issue.Number))
+			p.mu.Lock()
+			delete(p.processed, issue.Number)
+			p.mu.Unlock()
+			if p.processedStore != nil {
+				if err := p.processedStore.Unmark("github", p.repoKey(), strconv.Itoa(issue.Number)); err != nil {
+					p.logger.Warn("Failed to unmark issue in store",
+						slog.Int("number", issue.Number),
+						slog.Any("error", err))
+				}
+			}
+
+			if p.hasMergedWork(ctx, issue) {
+				continue
+			}
+		}
+
+		candidates = append(candidates, issue)
+	}
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		return candidates[i].CreatedAt.Before(candidates[j].CreatedAt)
+	})
+
+	for _, candidate := range candidates {
+		if !p.hasPendingDependencies(ctx, candidate) {
+			return candidate, nil
+		}
+		p.logger.Info("Skipping issue with pending dependencies",
+			slog.Int("number", candidate.Number),
+			slog.String("title", candidate.Title),
+		)
+	}
+
+	return nil, nil
+}
+
+func (p *Poller) processIssueSequential(ctx context.Context, issue *Issue) (*IssueResult, error) {
+	sanitizeIssueInPlace(p.logger, issue)
+
+	if p.onIssueWithResult != nil {
+		return p.onIssueWithResult(ctx, issue)
+	}
+
+	if p.onIssue != nil {
+		err := p.onIssue(ctx, issue)
+		if err != nil {
+			return &IssueResult{Success: false, Error: err}, err
+		}
+		return &IssueResult{Success: true}, nil
+	}
+
+	return nil, fmt.Errorf("no issue handler configured")
+}
+
+// groupByOverlappingScope partitions issues into groups where members reference
+// at least one common directory. Within each group only the oldest issue is dispatched.
+func groupByOverlappingScope(candidates []*Issue) [][]*Issue {
+	n := len(candidates)
+	if n == 0 {
+		return nil
+	}
+
+	parent := make([]int, n)
+	for i := range parent {
+		parent[i] = i
+	}
+	find := func(i int) int {
+		for parent[i] != i {
+			parent[i] = parent[parent[i]]
+			i = parent[i]
+		}
+		return i
+	}
+	union := func(a, b int) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[ra] = rb
+		}
+	}
+
+	dirs := make([]map[string]bool, n)
+	for i, c := range candidates {
+		dirs[i] = extractDirectoriesFromText(text.SanitizeUntrustedString(c.Body))
+	}
+	for i := 0; i < n; i++ {
+		if len(dirs[i]) == 0 {
+			continue
+		}
+		for j := i + 1; j < n; j++ {
+			if len(dirs[j]) == 0 {
+				continue
+			}
+			for d := range dirs[i] {
+				if dirs[j][d] {
+					union(i, j)
+					break
+				}
+			}
+		}
+	}
+
+	groups := make(map[int][]*Issue)
+	for i, c := range candidates {
+		root := find(i)
+		groups[root] = append(groups[root], c)
+	}
+
+	result := make([][]*Issue, 0, len(groups))
+	for _, g := range groups {
+		result = append(result, g)
+	}
+	return result
+}
+
+// filePathPattern matches file paths with common source-code extensions.
+var filePathPattern = regexp.MustCompile(`\b((?:[\w\-]+/)+[\w\-]+\.(?:go|py|ts|tsx|js|jsx|rs|java|rb|css|scss|html|yaml|yml|json|toml|sql|sh|md))\b`)
+
+// dirOnlyPattern matches directory-only references ending with a slash.
+var dirOnlyPattern = regexp.MustCompile(`\b((?:[\w\-]+/)+[\w\-]+/)(?:\s|$|[),;:"'])`)
+
+// extractDirectoriesFromText finds file paths and directory references in text
+// and returns their unique parent directories.
+func extractDirectoriesFromText(txt string) map[string]bool {
+	dirs := make(map[string]bool)
+
+	matches := filePathPattern.FindAllStringSubmatch(txt, -1)
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		filePath := m[1]
+		lastSlash := strings.LastIndex(filePath, "/")
+		if lastSlash > 0 {
+			dirs[filePath[:lastSlash]] = true
+		}
+	}
+
+	dirMatches := dirOnlyPattern.FindAllStringSubmatch(txt, -1)
+	for _, m := range dirMatches {
+		if len(m) < 2 {
+			continue
+		}
+		dir := strings.TrimRight(m[1], "/")
+		if dir != "" {
+			dirs[dir] = true
+		}
+	}
+
+	return dirs
+}
+
+func (p *Poller) repoKey() string { return p.owner + "/" + p.repo }
+
+func (p *Poller) recordSkip(reason string) {
+	if p.pollerMetrics != nil {
+		p.pollerMetrics.RecordPollerSkipped(p.repoKey(), reason)
+	}
+}
+
+func (p *Poller) recordDispatched() {
+	if p.pollerMetrics != nil {
+		p.pollerMetrics.RecordPollerDispatched(p.repoKey())
+	}
+}
+
+func (p *Poller) recordDeferredScopeOverlap() {
+	if p.pollerMetrics != nil {
+		p.pollerMetrics.RecordPollerDeferredScopeOverlap(p.repoKey())
+	}
+}
+
+func (p *Poller) checkForNewIssues(ctx context.Context) {
+	issues, err := p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
+		Labels: []string{p.label},
+		State:  StateOpen,
+		Sort:   "created",
+	})
+	if err != nil {
+		p.logger.Warn("Failed to fetch issues", slog.Any("error", err))
+		return
+	}
+
+	var candidates []*Issue
+	for _, issue := range issues {
+		if issue.PullRequest != nil {
+			continue
+		}
+
+		if HasLabel(issue, LabelInProgress) {
+			p.recordSkip(skipreason.ReasonInProgress)
+			continue
+		}
+
+		if HasLabel(issue, LabelBlocked) {
+			p.recordSkip(skipreason.ReasonBlocked)
+			continue
+		}
+
+		if HasLabel(issue, LabelNeedsClarification) {
+			p.recordSkip(skipreason.ReasonNeedsClarification)
+			continue
+		}
+
+		if p.skipSupersededByParent(ctx, issue) {
+			p.recordSkip(skipreason.ReasonSuperseded)
+			continue
+		}
+
+		if HasLabel(issue, LabelFailed) {
+			if !p.shouldRetryFailedIssue(ctx, issue) {
+				p.recordSkip(skipreason.ReasonFailedSkip)
+				continue
+			}
+		}
+
+		if HasLabel(issue, LabelRetryReady) {
+			if !p.shouldRetryRetryReadyIssue(ctx, issue) {
+				p.recordSkip(skipreason.ReasonRetryReadySkip)
+				continue
+			}
+		}
+
+		if HasLabel(issue, LabelDone) {
+			p.markProcessed(issue.Number)
+			p.recordSkip(skipreason.ReasonDone)
+			continue
+		}
+
+		p.mu.RLock()
+		processedAt, processed := p.processed[issue.Number]
+		p.mu.RUnlock()
+
+		if processed {
+			if p.retryGracePeriod > 0 && time.Since(processedAt) < p.retryGracePeriod {
+				p.logger.Debug("Issue within retry grace period, skipping",
+					slog.Int("number", issue.Number),
+					slog.Duration("elapsed", time.Since(processedAt)),
+					slog.Duration("grace_period", p.retryGracePeriod))
+				p.recordSkip(skipreason.ReasonProcessedGrace)
+				continue
+			}
+
+			p.logger.Info("Issue was processed but status labels removed, allowing retry",
+				slog.Int("number", issue.Number))
+			p.mu.Lock()
+			delete(p.processed, issue.Number)
+			p.mu.Unlock()
+			if p.processedStore != nil {
+				if err := p.processedStore.Unmark("github", p.repoKey(), strconv.Itoa(issue.Number)); err != nil {
+					p.logger.Warn("Failed to unmark issue in store",
+						slog.Int("number", issue.Number),
+						slog.Any("error", err))
+				}
+			}
+
+			if p.hasMergedWork(ctx, issue) {
+				p.recordSkip(skipreason.ReasonHasMergedWork)
+				continue
+			}
+		}
+
+		if p.hasPendingDependencies(ctx, issue) {
+			p.logger.Debug("Skipping issue with pending dependencies in parallel mode",
+				slog.Int("number", issue.Number),
+			)
+			p.recordSkip(skipreason.ReasonPendingDependency)
+			continue
+		}
+
+		candidates = append(candidates, issue)
+	}
+
+	// Group by overlapping scope; dispatch only oldest per group.
+	groups := groupByOverlappingScope(candidates)
+	var toDispatch []*Issue
+	for _, group := range groups {
+		if len(group) == 1 {
+			toDispatch = append(toDispatch, group[0])
+		} else {
+			sort.Slice(group, func(i, j int) bool {
+				return group[i].CreatedAt.Before(group[j].CreatedAt)
+			})
+			toDispatch = append(toDispatch, group[0])
+			for _, deferred := range group[1:] {
+				p.logger.Info("Deferring issue due to overlapping scope with older issue",
+					slog.Int("number", deferred.Number),
+					slog.Int("dispatched", group[0].Number),
+				)
+				p.recordDeferredScopeOverlap()
+			}
+		}
+	}
+
+	for _, issue := range toDispatch {
+		// Refresh labels before dispatch to avoid stale snapshot races.
+		if fresh, ferr := p.client.GetIssue(ctx, p.owner, p.repo, issue.Number); ferr == nil && fresh != nil {
+			if HasLabel(fresh, LabelDone) || HasLabel(fresh, LabelInProgress) {
+				p.logger.Info("Skipping dispatch — fresh labels show issue already handled",
+					slog.Int("number", issue.Number),
+					slog.Bool("done", HasLabel(fresh, LabelDone)),
+					slog.Bool("in_progress", HasLabel(fresh, LabelInProgress)),
+				)
+				p.markProcessed(issue.Number)
+				p.recordSkip(skipreason.ReasonFreshLabelCheck)
+				continue
+			}
+		} else if ferr != nil {
+			p.logger.Debug("Failed to refresh issue labels before dispatch — proceeding with snapshot",
+				slog.Int("number", issue.Number),
+				slog.Any("error", ferr),
+			)
+		}
+
+		p.markProcessed(issue.Number)
+
+		select {
+		case <-ctx.Done():
+			return
+		case p.semaphore <- struct{}{}:
+		}
+
+		p.recordDispatched()
+		p.logger.Info("Dispatching issue for parallel execution",
+			slog.Int("number", issue.Number),
+			slog.String("title", issue.Title),
+		)
+
+		p.wgMu.Lock()
+		if p.stopping.Load() {
+			p.wgMu.Unlock()
+			<-p.semaphore
+			return
+		}
+		p.activeWg.Add(1)
+		p.wgMu.Unlock()
+
+		go func(issue *Issue) {
+			defer p.activeWg.Done()
+			defer func() { <-p.semaphore }()
+
+			if p.onIssueWithResult != nil {
+				sanitizeIssueInPlace(p.logger, issue)
+				result, err := p.onIssueWithResult(ctx, issue)
+				if err != nil {
+					p.logger.Error("Failed to process issue",
+						slog.Int("number", issue.Number),
+						slog.Any("error", err),
+					)
+					p.unmarkProcessed(issue.Number)
+					return
+				}
+
+				if result != nil && !result.Success && result.PRNumber == 0 {
+					p.logger.Info("Execution failed without PR, unmarking for retry",
+						slog.Int("number", issue.Number),
+					)
+					p.unmarkProcessed(issue.Number)
+				}
+
+				if result != nil && result.PRNumber > 0 && p.OnPRCreated != nil {
+					p.logger.Info("Notifying of PR creation (parallel path)",
+						slog.Int("pr_number", result.PRNumber),
+						slog.Int("issue_number", issue.Number),
+						slog.String("branch", result.BranchName),
+					)
+					p.OnPRCreated(result.PRNumber, result.PRURL, issue.Number, result.HeadSHA, result.BranchName, issue.NodeID)
+				}
+			} else if p.onIssue != nil {
+				sanitizeIssueInPlace(p.logger, issue)
+				if err := p.onIssue(ctx, issue); err != nil {
+					p.logger.Error("Failed to process issue",
+						slog.Int("number", issue.Number),
+						slog.Any("error", err),
+					)
+					p.unmarkProcessed(issue.Number)
+				}
+			}
+		}(issue)
+	}
+}
+
+func (p *Poller) markProcessed(number int) {
+	p.mu.Lock()
+	p.processed[number] = time.Now()
+	p.mu.Unlock()
+
+	if p.processedStore != nil {
+		if err := p.processedStore.Mark("github", p.repoKey(), strconv.Itoa(number)); err != nil {
+			p.logger.Warn("Failed to persist processed issue", slog.Int("issue", number), slog.Any("error", err))
+		}
+	}
+}
+
+func (p *Poller) unmarkProcessed(number int) {
+	p.mu.Lock()
+	delete(p.processed, number)
+	p.mu.Unlock()
+
+	if p.processedStore != nil {
+		if err := p.processedStore.Unmark("github", p.repoKey(), strconv.Itoa(number)); err != nil {
+			p.logger.Warn("Failed to unmark processed issue", slog.Int("issue", number), slog.Any("error", err))
+		}
+	}
+}
+
+// hasMergedWork checks if the issue already has merged PRs.
+func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
+	found, err := p.client.SearchMergedPRsForIssue(ctx, p.owner, p.repo, issue.Number)
+	if err != nil {
+		p.logger.Warn("Failed to check for merged PRs",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", err),
+		)
+	}
+
+	if !found {
+		branch := fmt.Sprintf("pilot/GH-%d", issue.Number)
+		branchFound, berr := p.client.FindMergedPRByBranch(ctx, p.owner, p.repo, branch)
+		if berr != nil {
+			p.logger.Warn("Failed to check merged PRs by branch",
+				slog.Int("issue", issue.Number),
+				slog.String("branch", branch),
+				slog.Any("error", berr),
+			)
+			return false
+		}
+		if !branchFound {
+			return false
+		}
+		p.logger.Info("Merged PR found via branch lookup",
+			slog.Int("issue", issue.Number),
+			slog.String("branch", branch),
+		)
+	}
+
+	p.logger.Info("Issue already has merged PRs, marking as done",
+		slog.Int("issue", issue.Number),
+		slog.String("title", issue.Title),
+	)
+	if err := p.client.AddLabels(ctx, p.owner, p.repo, issue.Number, []string{LabelDone}); err != nil {
+		p.logger.Warn("Failed to add pilot-done label",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", err),
+		)
+	}
+	if err := p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, LabelFailed); err != nil {
+		p.logger.Debug("Failed to remove pilot-failed (may not exist)",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", err),
+		)
+	}
+	p.markProcessed(issue.Number)
+	return true
+}
+
+func (p *Poller) shouldRetryFailedIssue(ctx context.Context, issue *Issue) bool {
+	if issue.State != "open" {
+		return false
+	}
+
+	if HasLabel(issue, LabelDone) {
+		return false
+	}
+
+	if HasLabel(issue, LabelTitleRejected) {
+		p.logger.Info("Skipping retry — pilot-title-rejected set",
+			slog.Int("number", issue.Number),
+		)
+		return false
+	}
+
+	p.mu.RLock()
+	retries := p.failedRetryCount[issue.Number]
+	p.mu.RUnlock()
+
+	if retries >= p.maxFailedRetries {
+		p.logger.Warn("Issue has reached max failed retries, skipping",
+			slog.Int("number", issue.Number),
+			slog.Int("retries", retries),
+			slog.Int("max", p.maxFailedRetries),
+		)
+		return false
+	}
+
+	if p.hasMergedWork(ctx, issue) {
+		return false
+	}
+
+	if err := p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, LabelFailed); err != nil {
+		p.logger.Warn("Failed to remove pilot-failed label for retry",
+			slog.Int("number", issue.Number),
+			slog.Any("error", err),
+		)
+		return false
+	}
+
+	p.mu.Lock()
+	p.failedRetryCount[issue.Number] = retries + 1
+	p.mu.Unlock()
+
+	p.ClearProcessed(issue.Number)
+
+	p.logger.Info("Auto-retrying pilot-failed issue",
+		slog.Int("number", issue.Number),
+		slog.Int("retry", retries+1),
+		slog.Int("max", p.maxFailedRetries),
+	)
+
+	return true
+}
+
+func (p *Poller) shouldRetryRetryReadyIssue(ctx context.Context, issue *Issue) bool {
+	if issue.State != "open" {
+		return false
+	}
+
+	if HasLabel(issue, LabelDone) {
+		return false
+	}
+
+	if HasLabel(issue, LabelRetryExhausted) {
+		p.logger.Warn("Issue is pilot-retry-exhausted, skipping",
+			slog.Int("number", issue.Number),
+		)
+		return false
+	}
+
+	var currentRetryLabel, nextRetryLabel string
+	switch {
+	case HasLabel(issue, LabelRetry2):
+		currentRetryLabel = LabelRetry2
+		nextRetryLabel = LabelRetryExhausted
+	case HasLabel(issue, LabelRetry1):
+		currentRetryLabel = LabelRetry1
+		nextRetryLabel = LabelRetry2
+	default:
+		nextRetryLabel = LabelRetry1
+	}
+
+	if nextRetryLabel == LabelRetryExhausted {
+		if err := p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, currentRetryLabel); err != nil {
+			p.logger.Warn("Failed to remove prior retry label",
+				slog.Int("number", issue.Number),
+				slog.String("label", currentRetryLabel),
+				slog.Any("error", err),
+			)
+		}
+		if err := p.client.AddLabels(ctx, p.owner, p.repo, issue.Number, []string{LabelRetryExhausted}); err != nil {
+			p.logger.Warn("Failed to add pilot-retry-exhausted label",
+				slog.Int("number", issue.Number),
+				slog.Any("error", err),
+			)
+		}
+		_ = p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, LabelRetryReady)
+		p.logger.Warn("Issue exhausted retry budget — escalated to pilot-retry-exhausted",
+			slog.Int("number", issue.Number),
+		)
+		return false
+	}
+
+	if p.hasMergedWork(ctx, issue) {
+		return false
+	}
+
+	if currentRetryLabel != "" {
+		if err := p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, currentRetryLabel); err != nil {
+			p.logger.Warn("Failed to remove prior retry label",
+				slog.Int("number", issue.Number),
+				slog.String("label", currentRetryLabel),
+				slog.Any("error", err),
+			)
+		}
+	}
+	if err := p.client.AddLabels(ctx, p.owner, p.repo, issue.Number, []string{nextRetryLabel}); err != nil {
+		p.logger.Warn("Failed to add retry label",
+			slog.Int("number", issue.Number),
+			slog.String("label", nextRetryLabel),
+			slog.Any("error", err),
+		)
+	}
+
+	if err := p.client.RemoveLabel(ctx, p.owner, p.repo, issue.Number, LabelRetryReady); err != nil {
+		p.logger.Warn("Failed to remove pilot-retry-ready label for retry",
+			slog.Int("number", issue.Number),
+			slog.Any("error", err),
+		)
+		return false
+	}
+
+	p.mu.Lock()
+	p.retryReadyCount[issue.Number]++
+	p.mu.Unlock()
+
+	p.ClearProcessed(issue.Number)
+
+	p.logger.Info("Auto-retrying pilot-retry-ready issue",
+		slog.Int("number", issue.Number),
+		slog.String("retry_label", nextRetryLabel),
+	)
+
+	return true
+}
+
+// skipSupersededByParent auto-closes a sub-issue whose parent epic has already shipped.
+func (p *Poller) skipSupersededByParent(ctx context.Context, issue *Issue) bool {
+	parentNum := parseParentIssueNumber(issue.Body)
+	if parentNum <= 0 {
+		return false
+	}
+
+	parent, err := p.client.GetIssue(ctx, p.owner, p.repo, parentNum)
+	if err != nil {
+		p.logger.Warn("Failed to fetch parent issue, falling through to normal dispatch",
+			slog.Int("issue", issue.Number),
+			slog.Int("parent", parentNum),
+			slog.Any("error", err),
+		)
+		return false
+	}
+
+	if parent.State != StateClosed || !HasLabel(parent, LabelDone) {
+		return false
+	}
+
+	p.logger.Info("Auto-closing sub-issue: parent epic already shipped",
+		slog.Int("issue", issue.Number),
+		slog.Int("parent", parentNum),
+	)
+
+	comment := fmt.Sprintf(
+		"🔁 Auto-closed by Pilot: parent epic #%d already shipped this work. "+
+			"This sub-issue is redundant.",
+		parentNum,
+	)
+	if _, cerr := p.client.AddComment(ctx, p.owner, p.repo, issue.Number, comment); cerr != nil {
+		p.logger.Warn("Failed to post superseded comment",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", cerr),
+		)
+	}
+	if lerr := p.client.AddLabels(ctx, p.owner, p.repo, issue.Number, []string{LabelSuperseded}); lerr != nil {
+		p.logger.Warn("Failed to add pilot-superseded label",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", lerr),
+		)
+	}
+	if uerr := p.client.UpdateIssueState(ctx, p.owner, p.repo, issue.Number, StateClosed); uerr != nil {
+		p.logger.Warn("Failed to close superseded sub-issue",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", uerr),
+		)
+	}
+
+	p.markProcessed(issue.Number)
+	return true
+}
+
+// hasPendingDependencies checks if any of the issue's dependencies are still open.
+func (p *Poller) hasPendingDependencies(ctx context.Context, issue *Issue) bool {
+	deps := ParseDependencies(text.SanitizeUntrustedString(issue.Body))
+	if len(deps) == 0 {
+		return false
+	}
+
+	for _, depNum := range deps {
+		depIssue, err := p.client.GetIssue(ctx, p.owner, p.repo, depNum)
+		if err != nil {
+			p.logger.Warn("Failed to fetch dependency issue",
+				slog.Int("issue", issue.Number),
+				slog.Int("dependency", depNum),
+				slog.Any("error", err),
+			)
+			return true
+		}
+
+		if depIssue.State == "open" {
+			p.logger.Debug("Issue has open dependency, skipping",
+				slog.Int("issue", issue.Number),
+				slog.Int("dependency", depNum),
+			)
+			return true
+		}
+	}
+
+	return false
+}
+
+// Drain stops accepting new issues and waits for active executions to finish.
+func (p *Poller) Drain() {
+	p.logger.Info("Draining poller — no new issues will be accepted")
+	p.wgMu.Lock()
+	p.stopping.Store(true)
+	p.wgMu.Unlock()
+	p.activeWg.Wait()
+	p.logger.Info("Poller drained — all active tasks completed")
+}
+
+// WaitForActive waits for all active parallel goroutines to finish. Used in tests.
+func (p *Poller) WaitForActive() {
+	p.wgMu.Lock()
+	p.stopping.Store(true)
+	p.wgMu.Unlock()
+	p.activeWg.Wait()
+}
+
+// IsProcessed checks if an issue has been processed.
+func (p *Poller) IsProcessed(number int) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	_, ok := p.processed[number]
+	return ok
+}
+
+// ProcessedCount returns the number of processed issues.
+func (p *Poller) ProcessedCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.processed)
+}
+
+// Reset clears the processed issues map.
+func (p *Poller) Reset() {
+	p.mu.Lock()
+	p.processed = make(map[int]time.Time)
+	p.mu.Unlock()
+}
+
+// ClearProcessed removes a single issue from the processed map (for retry).
+func (p *Poller) ClearProcessed(number int) {
+	p.mu.Lock()
+	delete(p.processed, number)
+	p.mu.Unlock()
+
+	if p.processedStore != nil {
+		if err := p.processedStore.Unmark("github", p.repoKey(), strconv.Itoa(number)); err != nil {
+			p.logger.Warn("Failed to unmark issue in store",
+				slog.Int("number", number),
+				slog.Any("error", err))
+		}
+	}
+
+	p.logger.Debug("Cleared issue from processed map", slog.Int("number", number))
+}
+
+// ExtractPRNumber extracts PR number from a GitHub PR URL.
+// e.g., "https://github.com/owner/repo/pull/123" → 123.
+func ExtractPRNumber(prURL string) (int, error) {
+	if prURL == "" {
+		return 0, fmt.Errorf("empty PR URL")
+	}
+
+	re := regexp.MustCompile(`/pulls?/(\d+)`)
+	matches := re.FindStringSubmatch(prURL)
+	if len(matches) < 2 {
+		return 0, fmt.Errorf("could not extract PR number from URL: %s", prURL)
+	}
+
+	var num int
+	if _, err := fmt.Sscanf(matches[1], "%d", &num); err != nil {
+		return 0, fmt.Errorf("invalid PR number in URL: %s", prURL)
+	}
+
+	return num, nil
+}
+
+// dependencyRegex matches common dependency patterns in issue bodies.
+var dependencyRegex = regexp.MustCompile(`(?i)(?:depends\s+on|blocked\s+by|requires):?\s*#(\d+)`)
+
+// ParseDependencies extracts issue numbers that this issue depends on from the body.
+func ParseDependencies(body string) []int {
+	if body == "" {
+		return nil
+	}
+
+	matches := dependencyRegex.FindAllStringSubmatch(body, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	seen := make(map[int]bool)
+	var deps []int
+
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		var num int
+		if _, err := fmt.Sscanf(match[1], "%d", &num); err != nil {
+			continue
+		}
+		if num > 0 && !seen[num] {
+			seen[num] = true
+			deps = append(deps, num)
+		}
+	}
+
+	return deps
+}
+
+// parentRefRegex extracts parent issue references from issue body.
+var parentRefRegex = regexp.MustCompile(`(?m)^Parent:\s*(?:GH-|#)(\d+)`)
+
+// parseParentIssueNumber extracts the parent issue number from an issue body.
+// Returns 0 if no parent reference is found.
+func parseParentIssueNumber(body string) int {
+	matches := parentRefRegex.FindStringSubmatch(body)
+	if len(matches) < 2 {
+		return 0
+	}
+	var num int
+	_, _ = fmt.Sscanf(matches[1], "%d", &num)
+	return num
+}
