@@ -18,3 +18,13 @@ go.work.sum
 .DS_Store
 .idea/
 .vscode/
+
+# Navigator context markers
+.context-markers/
+
+# Navigator temporary files
+.agent/.nav-temp/
+
+# Navigator per-session runtime state (config is committed; these are not)
+.agent/.nav-read-counter.json
+.agent/.nav-workflow-state.json
