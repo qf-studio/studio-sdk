@@ -14,10 +14,10 @@ import (
 func TestMergeWaiter_WaitForMerge_Merged(t *testing.T) {
 	merged := true
 	pr := &PullRequest{
-		Number:  42,
-		State:   "closed",
-		Merged:  true,
-		HTMLURL: "https://github.com/owner/repo/pull/42",
+		Number:    42,
+		State:     "closed",
+		Merged:    true,
+		HTMLURL:   "https://github.com/owner/repo/pull/42",
 		Mergeable: &merged,
 	}
 
