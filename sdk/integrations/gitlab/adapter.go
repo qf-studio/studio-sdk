@@ -54,7 +54,7 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 		client = NewClient(a.config.Token, a.config.Project)
 	}
 
-	label := a.config.PilotLabel
+	label := a.config.TriggerLabel
 	if label == "" {
 		label = "pilot"
 	}
@@ -107,14 +107,17 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 }
 
 // toIssueEvent converts a GitLab Issue to a normalized core.IssueEvent.
+// The issue is expected to have already been sanitized in place (see
+// sanitizeIssueInPlace, called in the poll/webhook path before dispatch).
 func toIssueEvent(issue *Issue) core.IssueEvent {
 	return core.IssueEvent{
 		Action:     "created",
 		IssueID:    strconv.Itoa(issue.IID),
-		SequenceID: strconv.Itoa(issue.IID),
+		SequenceID: "GL-" + strconv.Itoa(issue.IID),
 		Title:      issue.Title,
 		Body:       issue.Description,
 		Labels:     issue.Labels,
+		Priority:   core.NormalizePriority(int(extractPriority(issue.Labels))),
 		ProjectID:  strconv.Itoa(issue.ProjectID),
 	}
 }

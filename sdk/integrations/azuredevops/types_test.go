@@ -16,8 +16,8 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("expected BaseURL 'https://dev.azure.com', got '%s'", config.BaseURL)
 	}
 
-	if config.PilotTag != "pilot" {
-		t.Errorf("expected PilotTag 'pilot', got '%s'", config.PilotTag)
+	if config.TriggerLabel != "pilot" {
+		t.Errorf("expected TriggerLabel 'pilot', got '%s'", config.TriggerLabel)
 	}
 
 	if len(config.WorkItemTypes) != 3 {
@@ -60,26 +60,6 @@ func TestPriorityFromValue(t *testing.T) {
 		result := PriorityFromValue(tt.value)
 		if result != tt.expected {
 			t.Errorf("PriorityFromValue(%d) = %d, expected %d", tt.value, result, tt.expected)
-		}
-	}
-}
-
-func TestPriorityName(t *testing.T) {
-	tests := []struct {
-		priority Priority
-		expected string
-	}{
-		{PriorityUrgent, "Urgent"},
-		{PriorityHigh, "High"},
-		{PriorityMedium, "Medium"},
-		{PriorityLow, "Low"},
-		{PriorityNone, "No Priority"},
-	}
-
-	for _, tt := range tests {
-		result := PriorityName(tt.priority)
-		if result != tt.expected {
-			t.Errorf("PriorityName(%d) = '%s', expected '%s'", tt.priority, result, tt.expected)
 		}
 	}
 }

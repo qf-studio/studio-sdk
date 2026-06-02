@@ -181,7 +181,7 @@ func (p *Poller) Start(ctx context.Context) error {
 // cacheLabelIDs fetches and caches the UUIDs for pilot-related labels across all configured projects.
 // Plane labels are per-project, so we resolve from the first project that has matching labels.
 func (p *Poller) cacheLabelIDs(ctx context.Context) error {
-	pilotLabelName := p.config.PilotLabel
+	pilotLabelName := p.config.TriggerLabel
 	if pilotLabelName == "" {
 		pilotLabelName = LabelPilot
 	}

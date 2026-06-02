@@ -8,8 +8,8 @@ type Config struct {
 	Token             string                   `yaml:"token"`          // Personal Access Token or Project Access Token
 	BaseURL           string                   `yaml:"base_url"`       // Default: https://gitlab.com
 	WebhookSecret     string                   `yaml:"webhook_secret"` // Simple token for X-Gitlab-Token header
-	PilotLabel        string                   `yaml:"pilot_label"`
-	Project           string                   `yaml:"project"` // Project path in "namespace/project" format
+	TriggerLabel      string                   `yaml:"trigger_label"`  // Label that marks an issue for the host to pick up (default: "pilot")
+	Project           string                   `yaml:"project"`        // Project path in "namespace/project" format
 	Polling           *PollingConfig           `yaml:"polling"`
 	StaleLabelCleanup *StaleLabelCleanupConfig `yaml:"stale_label_cleanup"`
 }
@@ -31,9 +31,9 @@ type StaleLabelCleanupConfig struct {
 // DefaultConfig returns default GitLab configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Enabled:    false,
-		BaseURL:    "https://gitlab.com",
-		PilotLabel: "pilot",
+		Enabled:      false,
+		BaseURL:      "https://gitlab.com",
+		TriggerLabel: "pilot",
 		Polling: &PollingConfig{
 			Enabled:  false,
 			Interval: 30 * time.Second,
@@ -93,22 +93,6 @@ func PriorityFromLabel(label string) Priority {
 		return PriorityLow
 	default:
 		return PriorityNone
-	}
-}
-
-// PriorityName returns the human-readable priority name
-func PriorityName(priority Priority) string {
-	switch priority {
-	case PriorityUrgent:
-		return "Urgent"
-	case PriorityHigh:
-		return "High"
-	case PriorityMedium:
-		return "Medium"
-	case PriorityLow:
-		return "Low"
-	default:
-		return "No Priority"
 	}
 }
 

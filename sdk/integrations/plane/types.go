@@ -10,7 +10,7 @@ type Config struct {
 	WebhookSecret string         `yaml:"webhook_secret"` // For HMAC signature verification
 	WorkspaceSlug string         `yaml:"workspace_slug"`
 	ProjectIDs    []string       `yaml:"project_ids"`
-	PilotLabel    string         `yaml:"pilot_label"` // default: "pilot"
+	TriggerLabel  string         `yaml:"trigger_label"` // Label that marks a work item for the host to pick up (default: "pilot")
 	Polling       *PollingConfig `yaml:"polling,omitempty"`
 }
 
@@ -23,9 +23,9 @@ type PollingConfig struct {
 // DefaultConfig returns default Plane configuration.
 func DefaultConfig() *Config {
 	return &Config{
-		Enabled:    false,
-		BaseURL:    "https://api.plane.so",
-		PilotLabel: "pilot",
+		Enabled:      false,
+		BaseURL:      "https://api.plane.so",
+		TriggerLabel: "pilot",
 	}
 }
 
@@ -51,38 +51,6 @@ const (
 	PriorityMedium Priority = 3
 	PriorityLow    Priority = 4
 )
-
-// PriorityName returns the human-readable priority name.
-func PriorityName(p Priority) string {
-	switch p {
-	case PriorityUrgent:
-		return "Urgent"
-	case PriorityHigh:
-		return "High"
-	case PriorityMedium:
-		return "Medium"
-	case PriorityLow:
-		return "Low"
-	default:
-		return "None"
-	}
-}
-
-// priorityString returns the normalized lowercase priority string used in core.IssueEvent.
-func priorityString(p Priority) string {
-	switch p {
-	case PriorityUrgent:
-		return "urgent"
-	case PriorityHigh:
-		return "high"
-	case PriorityMedium:
-		return "medium"
-	case PriorityLow:
-		return "low"
-	default:
-		return "none"
-	}
-}
 
 // WorkItem represents a Plane work item (formerly "issue").
 // Uses /work-items/ API endpoints (NOT deprecated /issues/).

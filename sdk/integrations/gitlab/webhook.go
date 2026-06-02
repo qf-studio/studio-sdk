@@ -135,6 +135,10 @@ func (h *WebhookHandler) processIssue(ctx context.Context, payload *IssueWebhook
 		DefaultBranch:     payload.Project.DefaultBranch,
 	}
 
+	// Strip invisible-Unicode prompt-injection vectors before the issue
+	// reaches any downstream consumer (mirrors the poller path).
+	sanitizeIssueInPlace(h.logger, fullIssue)
+
 	// Call the callback
 	if h.onIssue != nil {
 		return h.onIssue(ctx, fullIssue, project)

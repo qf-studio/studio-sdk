@@ -420,6 +420,8 @@ func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error)
 }
 
 func (p *Poller) processIssueSequential(ctx context.Context, issue *Issue) (*IssueResult, error) {
+	sanitizeIssueInPlace(p.logger, issue)
+
 	if p.onIssueWithResult != nil {
 		return p.onIssueWithResult(ctx, issue)
 	}
@@ -512,6 +514,8 @@ func (p *Poller) processIssueAsync(ctx context.Context, issue *Issue) {
 	if p.onIssueWithResult == nil && p.onIssue == nil {
 		return
 	}
+
+	sanitizeIssueInPlace(p.logger, issue)
 
 	if err := p.client.AddIssueLabels(ctx, issue.IID, []string{LabelInProgress}); err != nil {
 		p.logger.Warn("Failed to add in-progress label",

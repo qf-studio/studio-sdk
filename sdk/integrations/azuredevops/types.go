@@ -11,7 +11,7 @@ type Config struct {
 	Repository        string                   `yaml:"repository"`      // Repository name (optional, defaults to project)
 	BaseURL           string                   `yaml:"base_url"`        // Default: https://dev.azure.com
 	WebhookSecret     string                   `yaml:"webhook_secret"`  // For basic auth on webhook endpoint
-	PilotTag          string                   `yaml:"pilot_tag"`       // Tag to watch (Azure uses tags, not labels)
+	TriggerLabel      string                   `yaml:"trigger_label"`   // Tag that marks a work item for the host to pick up; Azure stores it as a tag (default: "pilot")
 	WorkItemTypes     []string                 `yaml:"work_item_types"` // e.g., ["Bug", "Task", "User Story"]
 	Polling           *PollingConfig           `yaml:"polling"`
 	StaleLabelCleanup *StaleLabelCleanupConfig `yaml:"stale_label_cleanup"`
@@ -33,9 +33,9 @@ type StaleLabelCleanupConfig struct {
 // DefaultConfig returns default Azure DevOps configuration
 func DefaultConfig() *Config {
 	return &Config{
-		Enabled:  false,
-		BaseURL:  "https://dev.azure.com",
-		PilotTag: "pilot",
+		Enabled:      false,
+		BaseURL:      "https://dev.azure.com",
+		TriggerLabel: "pilot",
 		WorkItemTypes: []string{
 			"Bug",
 			"Task",
@@ -101,22 +101,6 @@ func PriorityFromValue(value int) Priority {
 		return PriorityLow
 	default:
 		return PriorityNone
-	}
-}
-
-// PriorityName returns the human-readable priority name
-func PriorityName(priority Priority) string {
-	switch priority {
-	case PriorityUrgent:
-		return "Urgent"
-	case PriorityHigh:
-		return "High"
-	case PriorityMedium:
-		return "Medium"
-	case PriorityLow:
-		return "Low"
-	default:
-		return "No Priority"
 	}
 }
 
