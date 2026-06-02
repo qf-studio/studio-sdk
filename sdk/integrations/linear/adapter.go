@@ -54,11 +54,6 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	ws := workspaces[0]
 	client := NewClient(ws.APIKey)
 
-	label := ws.TriggerLabel
-	if label == "" {
-		label = "pilot"
-	}
-
 	interval := 30 * time.Second
 	if a.config.Polling != nil && a.config.Polling.Interval > 0 {
 		interval = a.config.Polling.Interval
