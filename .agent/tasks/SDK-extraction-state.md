@@ -5,7 +5,7 @@
 **Driver:** Pilot drives studio-sdk via the GH Project board "Studio SDK"
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
-**Current tag:** `v0.15.0` — github (`v0.10/0.11`) + linear (`v0.12/0.13`) + jira (`v0.14/0.15`) complete. asana in flight (last of the quartet).
+**Current tag:** `v0.17.0` — **issue-tracker quartet COMPLETE**: github (`v0.10/0.11`) + linear (`v0.12/0.13`) + jira (`v0.14/0.15`) + asana (`v0.16/0.17`). 7/10 connectors done. Remaining = chat trio (slack/telegram/discord), which needs an `sdk/core` chat-bridge design first.
 **Releases are daemon-automated:** the Pilot daemon auto-tags a release on every
 merge to main (`release: version_strategy: conventional_commits, tag_prefix: v`
 in `~/.pilot/config.yaml`) → one minor bump *per merged PR*, as lightweight tags.
@@ -52,12 +52,13 @@ work below.
 | `github`       | M3   | PR #30 (#28, v0.10.0), PR #31 (#29, v0.11.0) |
 | `linear`       | M4   | PR #34 (#32, v0.12.0), PR #37 (#33, v0.13.0) |
 | `jira`         | M5   | PR #40 (#38, v0.14.0), PR #41 (#39, v0.15.0) |
+| `asana`        | M6   | PR #44 (#42, v0.16.0), PR #45 (#43, v0.17.0) |
 
-All six: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
-`linear`/`jira` are narrower (no merger/cleanup; host-delegated); stdlib-only.
-`jira` required dropping the host prompt layer (`TaskInfo`/`ConvertIssueToTask`/
+All seven: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
+`linear`/`jira`/`asana` are narrower (no merger/cleanup; host-delegated); stdlib-only.
+`jira`/`asana` required dropping the host prompt layer (`TaskInfo`/`ConvertToTaskInfo`/
 `BuildTaskPrompt`) while preserving sanitize in the live path — same as PR #26.
-**Issue-tracker quartet (github→linear→jira→asana): asana (#42/#43) in flight.**
+**Issue-tracker quartet (github→linear→jira→asana) COMPLETE @ v0.17.0.**
 
 ### GitHub connector (M3) — SHIPPED (2026-06-02, v0.11.0)
 Stdlib-only after all (uses `net/http`, **no** `go-github` dep — the expected
@@ -107,13 +108,18 @@ Applied across all 3 connectors in one pass:
 
 ## What remains
 
-### Connectors NOT yet extracted (4 / 10)
+### Connectors NOT yet extracted (3 / 10)
 Still in Pilot at `internal/adapters/`:
 
-- `asana`    ← **IN FLIGHT** (M6, #42/#43 — last of the issue-tracker quartet)
 - `slack`     ← chat — *unproven shape*; doesn't fit issue-poller mold
 - `telegram`  ← chat — same
 - `discord`   ← chat — same
+
+**The chat trio is NOT a mechanical recipe reuse.** Unlike the issue-tracker
+quartet, chat adapters don't poll issues — they receive messages/commands and
+stream replies. They need an `sdk/core` **chat-bridge contract designed first**
+(see `system/chat-bridge-design.md`), then per-platform ports. This is the next
+decision point, not an autopilot continuation.
 
 Issue-tracker quartet (`github`, `linear`, `jira`, `asana`) is mechanical
 reuse of the proven recipe. Chat trio needs an `sdk/core` bridge designed
