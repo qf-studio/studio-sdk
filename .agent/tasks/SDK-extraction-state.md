@@ -5,12 +5,18 @@
 **Driver:** Pilot drives studio-sdk via the GH Project board "Studio SDK"
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
-**Current tag:** `v0.11.0` (origin/main, `6a9ec9f`) — github connector complete.
+**Current tag:** `v0.13.0` — github (`v0.10/0.11`) + linear (`v0.12/0.13`) complete.
 **Releases are daemon-automated:** the Pilot daemon auto-tags a release on every
 merge to main (`release: version_strategy: conventional_commits, tag_prefix: v`
 in `~/.pilot/config.yaml`) → one minor bump *per merged PR*, as lightweight tags.
 The driver loop does NOT `git tag`; we add annotated GitHub Releases with
 changelogs on top of the daemon's tags. So each connector consumes ~2 minors.
+**Daemon finalization is flaky:** the worker commits + exits `success`, but the
+daemon often stalls before push/PR (hit #29/#32/#33), then either finalizes
+~15-20 min late (duplicate PR — close it) or marks the issue `pilot-retry-ready`
+and deletes the branch (auto-closing the recovery PR). Recovery: push the worker
+commit from its worktree, open the PR, remove `pilot-retry-ready`, merge promptly
+(merging closes the issue → kills the retry). See [[pilot-daemon-logs]].
 **Local checkout:** reconciled to `origin/main` (`a9af2dd`) on 2026-06-02. The
 prior diverged local fork (`455842e`, which had reworked `ActiveExecutionLister`
 to `ActiveBranches` and stripped `ExecutionMode`/`MergeWaiter`/metrics tests)
@@ -37,15 +43,18 @@ work below.
   push-protected tests.
 - `Makefile` (`build`/`test`/`lint`/`fmt`/`tidy`) + `sdk/doc.go`.
 
-### Connectors extracted (4 / 10)
+### Connectors extracted (5 / 10)
 | Connector | Milestone | Commits / PRs |
 | --------- | --------- | ------------- |
 | `plane`        | M1   | `12f4f82`, PR #10 |
 | `gitlab`       | M2.2 | `2bb4f67` (PR #19), `e41ab23` (PR #21) |
 | `azuredevops`  | M2.3 | `d2086e1` (PR #23), `a9af2dd` (PR #25) |
 | `github`       | M3   | PR #30 (#28, v0.10.0), PR #31 (#29, v0.11.0) |
+| `linear`       | M4   | PR #34 (#32, v0.12.0), PR #37 (#33, v0.13.0) |
 
-All four: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
+All five: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
+`linear` is narrower (no merger/cleanup; has `multi_workspace`); stdlib-only
+(dropped the `yaml.v3` test dep + the `SubIssueCreator`/`Parent:` epic logic).
 
 ### GitHub connector (M3) — SHIPPED (2026-06-02, v0.11.0)
 Stdlib-only after all (uses `net/http`, **no** `go-github` dep — the expected
@@ -95,11 +104,10 @@ Applied across all 3 connectors in one pass:
 
 ## What remains
 
-### Connectors NOT yet extracted (5 / 10)
+### Connectors NOT yet extracted (4 / 10)
 Still in Pilot at `internal/adapters/`:
 
-- `linear`    ← **NEXT** (M4 — issue-tracker quartet, mechanical recipe reuse)
-- `jira`
+- `jira`     ← **NEXT** (M5 — issue-tracker quartet)
 - `asana`
 - `slack`     ← chat — *unproven shape*; doesn't fit issue-poller mold
 - `telegram`  ← chat — same
