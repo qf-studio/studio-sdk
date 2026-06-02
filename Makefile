@@ -1,4 +1,4 @@
-.PHONY: help build test lint fmt tidy
+.PHONY: help build test lint fmt tidy check-secrets
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-10s %s\n", $$1, $$2}'
@@ -18,3 +18,6 @@ fmt: ## gofmt -w .
 
 tidy: ## go mod tidy
 	go mod tidy
+
+check-secrets: ## scan tracked files for realistic secret patterns
+	./scripts/check-secret-patterns.sh
