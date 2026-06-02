@@ -10,4 +10,7 @@ const (
 
 	FakeAzureDevOpsPAT           = "test-azure-devops-pat"
 	FakeAzureDevOpsWebhookSecret = "test-azure-devops-webhook-secret"
+
+	FakeGitHubToken         = "test-github-token"
+	FakeGitHubWebhookSecret = "test-github-webhook-secret"
 )
