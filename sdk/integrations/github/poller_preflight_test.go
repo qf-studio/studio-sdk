@@ -1,0 +1,190 @@
+package github
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/testutil"
+)
+
+// pollerTestServer is a minimal test server for poller tests.
+type pollerTestServer struct {
+	server *httptest.Server
+	mu     sync.Mutex
+	labels []string
+}
+
+func newPollerTestServer(issue *Issue) *pollerTestServer {
+	ts := &pollerTestServer{}
+	ts.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/labels"):
+			var body struct {
+				Labels []string `json:"labels"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			ts.mu.Lock()
+			ts.labels = append(ts.labels, body.Labels...)
+			ts.mu.Unlock()
+			_, _ = w.Write([]byte("[]"))
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/labels/"):
+			parts := strings.Split(r.URL.Path, "/")
+			label := parts[len(parts)-1]
+			ts.mu.Lock()
+			newLabels := ts.labels[:0]
+			for _, l := range ts.labels {
+				if l != label {
+					newLabels = append(newLabels, l)
+				}
+			}
+			ts.labels = newLabels
+			ts.mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/comments"):
+			_, _ = w.Write([]byte(`{"id":1}`))
+		default:
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			lastSegment := ""
+			if len(parts) > 0 {
+				lastSegment = parts[len(parts)-1]
+			}
+			isSingleGet := len(lastSegment) > 0 && lastSegment[0] >= '0' && lastSegment[0] <= '9'
+			if isSingleGet {
+				_, _ = w.Write(mustJSON(issue))
+			} else {
+				_, _ = w.Write(mustJSON([]*Issue{issue}))
+			}
+		}
+	}))
+	return ts
+}
+
+func (ts *pollerTestServer) close() { ts.server.Close() }
+
+func TestPoller_ParallelDispatch_CallsHandler(t *testing.T) {
+	pilot := Label{Name: "pilot"}
+	issue := &Issue{
+		Number:    42,
+		Title:     "Fix the thing",
+		Body:      "Details here",
+		State:     "open",
+		Labels:    []Label{pilot},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+
+	ts := newPollerTestServer(issue)
+	defer ts.close()
+
+	var handled sync.WaitGroup
+	handled.Add(1)
+	var handledIssue *Issue
+	var mu sync.Mutex
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second,
+		WithOnIssue(func(ctx context.Context, iss *Issue) error {
+			mu.Lock()
+			handledIssue = iss
+			mu.Unlock()
+			handled.Done()
+			return nil
+		}),
+		WithRetryGracePeriod(0),
+	)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	poller.checkForNewIssues(context.Background())
+	poller.WaitForActive()
+
+	mu.Lock()
+	got := handledIssue
+	mu.Unlock()
+
+	if got == nil {
+		t.Fatal("handler was never called")
+	}
+	if got.Number != 42 {
+		t.Errorf("handler got issue %d, want 42", got.Number)
+	}
+}
+
+func TestPoller_NewPoller_InvalidRepo(t *testing.T) {
+	_, err := NewPoller(nil, "badrepo", "pilot", 30*time.Second)
+	if err == nil {
+		t.Fatal("expected error for invalid repo format, got nil")
+	}
+}
+
+func TestPoller_IsProcessed_TracksMark(t *testing.T) {
+	p := &Poller{
+		processed: make(map[int]time.Time),
+		logger:    nil,
+	}
+	if p.IsProcessed(1) {
+		t.Error("issue 1 should not be processed yet")
+	}
+	p.processed[1] = time.Now()
+	if !p.IsProcessed(1) {
+		t.Error("issue 1 should be processed after mark")
+	}
+	p.Reset()
+	if p.IsProcessed(1) {
+		t.Error("issue 1 should not be processed after reset")
+	}
+}
+
+func TestPoller_ParseDependencies(t *testing.T) {
+	tests := []struct {
+		body string
+		want []int
+	}{
+		{"", nil},
+		{"Depends on: #123", []int{123}},
+		{"Blocked by #456\nDepends on: #789", []int{456, 789}},
+		{"Requires: #42", []int{42}},
+		{"No dependencies", nil},
+	}
+	for _, tt := range tests {
+		got := ParseDependencies(tt.body)
+		if len(got) != len(tt.want) {
+			t.Errorf("ParseDependencies(%q) = %v, want %v", tt.body, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("ParseDependencies(%q)[%d] = %d, want %d", tt.body, i, got[i], tt.want[i])
+			}
+		}
+	}
+}
+
+func TestPoller_ExtractPRNumber(t *testing.T) {
+	tests := []struct {
+		url     string
+		want    int
+		wantErr bool
+	}{
+		{"https://github.com/owner/repo/pull/123", 123, false},
+		{"https://github.com/owner/repo/pulls/456", 456, false},
+		{"", 0, true},
+		{"https://github.com/owner/repo/issues/42", 0, true},
+	}
+	for _, tt := range tests {
+		got, err := ExtractPRNumber(tt.url)
+		if (err != nil) != tt.wantErr {
+			t.Errorf("ExtractPRNumber(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
+		}
+		if !tt.wantErr && got != tt.want {
+			t.Errorf("ExtractPRNumber(%q) = %d, want %d", tt.url, got, tt.want)
+		}
+	}
+}
