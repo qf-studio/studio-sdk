@@ -88,7 +88,7 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 func toIssueEvent(item *WorkItem) core.IssueEvent {
 	seqID := ""
 	if item.SequenceID != 0 {
-		seqID = strconv.Itoa(item.SequenceID)
+		seqID = "PLANE-" + strconv.Itoa(item.SequenceID)
 	}
 	return core.IssueEvent{
 		Action:     "created",
@@ -97,7 +97,7 @@ func toIssueEvent(item *WorkItem) core.IssueEvent {
 		Title:      item.Name,
 		Body:       item.Description,
 		Labels:     item.LabelIDs,
-		Priority:   priorityString(item.Priority),
+		Priority:   core.NormalizePriority(int(item.Priority)),
 		ProjectID:  item.ProjectID,
 	}
 }

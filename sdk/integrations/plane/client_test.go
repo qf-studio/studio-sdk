@@ -281,25 +281,6 @@ func TestRateLimitRetry(t *testing.T) {
 	}
 }
 
-func TestPriorityName(t *testing.T) {
-	tests := []struct {
-		p    Priority
-		want string
-	}{
-		{PriorityNone, "None"},
-		{PriorityUrgent, "Urgent"},
-		{PriorityHigh, "High"},
-		{PriorityMedium, "Medium"},
-		{PriorityLow, "Low"},
-	}
-	for _, tt := range tests {
-		got := PriorityName(tt.p)
-		if got != tt.want {
-			t.Errorf("PriorityName(%d) = %s, want %s", tt.p, got, tt.want)
-		}
-	}
-}
-
 func TestUpdateIssueState(t *testing.T) {
 	var gotBody map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -502,7 +483,7 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.BaseURL != "https://api.plane.so" {
 		t.Errorf("expected default BaseURL https://api.plane.so, got %s", cfg.BaseURL)
 	}
-	if cfg.PilotLabel != "pilot" {
-		t.Errorf("expected default PilotLabel pilot, got %s", cfg.PilotLabel)
+	if cfg.TriggerLabel != "pilot" {
+		t.Errorf("expected default TriggerLabel pilot, got %s", cfg.TriggerLabel)
 	}
 }

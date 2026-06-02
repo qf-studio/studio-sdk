@@ -428,6 +428,8 @@ func (p *Poller) findOldestUnprocessedWorkItem(ctx context.Context) (*WorkItem, 
 }
 
 func (p *Poller) processWorkItemSequential(ctx context.Context, wi *WorkItem) (*WorkItemResult, error) {
+	sanitizeWorkItemFields(p.logger, wi)
+
 	if p.onWorkItemWithResult != nil {
 		return p.onWorkItemWithResult(ctx, wi)
 	}
@@ -519,6 +521,8 @@ func (p *Poller) processWorkItemAsync(ctx context.Context, wi *WorkItem) {
 	if p.onWorkItemWithResult == nil && p.onWorkItem == nil {
 		return
 	}
+
+	sanitizeWorkItemFields(p.logger, wi)
 
 	if err := p.client.AddWorkItemTag(ctx, wi.ID, TagInProgress); err != nil {
 		p.logger.Warn("Failed to add in-progress tag",

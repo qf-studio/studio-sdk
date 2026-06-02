@@ -603,8 +603,8 @@ func TestDefaultConfig(t *testing.T) {
 		t.Errorf("default BaseURL = %s, want 'https://gitlab.com'", cfg.BaseURL)
 	}
 
-	if cfg.PilotLabel != "pilot" {
-		t.Errorf("default PilotLabel = %s, want 'pilot'", cfg.PilotLabel)
+	if cfg.TriggerLabel != "pilot" {
+		t.Errorf("default TriggerLabel = %s, want 'pilot'", cfg.TriggerLabel)
 	}
 
 	if cfg.Polling == nil {

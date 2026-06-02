@@ -168,6 +168,10 @@ func (h *WebhookHandler) processWorkItem(ctx context.Context, workItemID int) er
 		slog.String("type", fullWorkItem.GetWorkItemType()),
 	)
 
+	// Strip invisible-Unicode prompt-injection vectors before the work item
+	// reaches any downstream consumer (mirrors the poller path).
+	sanitizeWorkItemFields(h.logger, fullWorkItem)
+
 	// Call the callback
 	if h.onWorkItem != nil {
 		return h.onWorkItem(ctx, fullWorkItem)

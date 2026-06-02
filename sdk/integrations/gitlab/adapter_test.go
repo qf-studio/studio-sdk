@@ -83,8 +83,8 @@ func TestToIssueEvent(t *testing.T) {
 	if ev.IssueID != "42" {
 		t.Errorf("IssueID = %q, want %q", ev.IssueID, "42")
 	}
-	if ev.SequenceID != "42" {
-		t.Errorf("SequenceID = %q, want %q", ev.SequenceID, "42")
+	if ev.SequenceID != "GL-42" {
+		t.Errorf("SequenceID = %q, want %q", ev.SequenceID, "GL-42")
 	}
 	if ev.Title != "Fix the bug" {
 		t.Errorf("Title = %q, want %q", ev.Title, "Fix the bug")
@@ -97,5 +97,23 @@ func TestToIssueEvent(t *testing.T) {
 	}
 	if len(ev.Labels) != 2 {
 		t.Errorf("len(Labels) = %d, want 2", len(ev.Labels))
+	}
+	// No priority label → normalized "none".
+	if ev.Priority != core.PriorityNone {
+		t.Errorf("Priority = %q, want %q", ev.Priority, core.PriorityNone)
+	}
+}
+
+func TestToIssueEvent_PriorityFromLabel(t *testing.T) {
+	issue := &Issue{
+		IID:    7,
+		Title:  "Urgent thing",
+		Labels: []string{"pilot", "priority::high"},
+	}
+
+	ev := toIssueEvent(issue)
+
+	if ev.Priority != core.PriorityHigh {
+		t.Errorf("Priority = %q, want %q", ev.Priority, core.PriorityHigh)
 	}
 }

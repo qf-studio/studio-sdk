@@ -58,7 +58,7 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 		client.repository = a.config.Repository
 	}
 
-	tag := a.config.PilotTag
+	tag := a.config.TriggerLabel
 	if tag == "" {
 		tag = "pilot"
 	}
@@ -114,14 +114,17 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 }
 
 // toIssueEvent converts an Azure DevOps WorkItem to a normalized core.IssueEvent.
+// The work item is expected to have already been sanitized in place (see
+// sanitizeWorkItemFields, called in the poll/webhook path before dispatch).
 func toIssueEvent(wi *WorkItem) core.IssueEvent {
 	return core.IssueEvent{
 		Action:     "created",
 		IssueID:    strconv.Itoa(wi.ID),
-		SequenceID: strconv.Itoa(wi.ID),
+		SequenceID: "AZDO-" + strconv.Itoa(wi.ID),
 		Title:      wi.GetTitle(),
 		Body:       wi.GetDescription(),
 		Labels:     wi.GetTags(),
+		Priority:   core.NormalizePriority(int(wi.GetPriority())),
 		ProjectID:  wi.GetWorkItemType(),
 	}
 }

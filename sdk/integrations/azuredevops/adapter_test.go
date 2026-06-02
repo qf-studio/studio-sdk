@@ -86,8 +86,8 @@ func TestToIssueEvent(t *testing.T) {
 	if ev.IssueID != "42" {
 		t.Errorf("IssueID = %q, want %q", ev.IssueID, "42")
 	}
-	if ev.SequenceID != "42" {
-		t.Errorf("SequenceID = %q, want %q", ev.SequenceID, "42")
+	if ev.SequenceID != "AZDO-42" {
+		t.Errorf("SequenceID = %q, want %q", ev.SequenceID, "AZDO-42")
 	}
 	if ev.Title != "Fix the bug" {
 		t.Errorf("Title = %q, want %q", ev.Title, "Fix the bug")
@@ -100,5 +100,25 @@ func TestToIssueEvent(t *testing.T) {
 	}
 	if len(ev.Labels) != 2 {
 		t.Errorf("len(Labels) = %d, want 2", len(ev.Labels))
+	}
+	// No priority field → normalized "none".
+	if ev.Priority != core.PriorityNone {
+		t.Errorf("Priority = %q, want %q", ev.Priority, core.PriorityNone)
+	}
+}
+
+func TestToIssueEvent_Priority(t *testing.T) {
+	wi := &WorkItem{
+		ID: 9,
+		Fields: map[string]interface{}{
+			"System.Title":                   "High pri",
+			"Microsoft.VSTS.Common.Priority": float64(2), // Azure 2 → High
+		},
+	}
+
+	ev := toIssueEvent(wi)
+
+	if ev.Priority != core.PriorityHigh {
+		t.Errorf("Priority = %q, want %q", ev.Priority, core.PriorityHigh)
 	}
 }
