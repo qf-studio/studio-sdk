@@ -19,4 +19,6 @@ const (
 
 	FakeJiraToken         = "test-jira-token"
 	FakeJiraWebhookSecret = "test-jira-webhook-secret"
+	FakeJiraUsername      = "test-jira-username"
+	FakeJiraAPIToken      = "test-jira-api-token"
 )
