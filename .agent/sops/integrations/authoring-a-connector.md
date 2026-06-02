@@ -134,3 +134,11 @@ gh repo clone qf-studio/pilot /tmp/pilot-src -- --depth 1
 Drop host-domain helpers during the port (prompt builders, `TaskInfo`), wire
 sanitize into the live path, normalize priority via `core`, and rename the
 trigger field to `TriggerLabel`.
+
+---
+
+## See also
+
+- [driving-the-sdk-board](../development/driving-the-sdk-board.md) — the
+  operational loop: file the 2 issues, move to `Todo` to dispatch (the daemon
+  ignores the `pilot` label alone), review, manual merge, clean the board.

@@ -68,12 +68,14 @@ These are load-bearing — every change should respect them:
 ## When to Read What
 
 ### New connector (e.g., `sdk/integrations/<name>`)
-1. `sops/integrations/authoring-a-connector.md` → the recipe + contract reference
-2. `system/project-architecture.md` → `sdk/core` contracts + boundary conventions
-3. A full connector as structural reference (`gitlab` or `azuredevops`; `plane`
+1. `sops/development/driving-the-sdk-board.md` → how work reaches Pilot
+   (board `Status=Todo` gate — the daemon ignores the label alone)
+2. `sops/integrations/authoring-a-connector.md` → the recipe + contract reference
+3. `system/project-architecture.md` → `sdk/core` contracts + boundary conventions
+4. A full connector as structural reference (`gitlab` or `azuredevops`; `plane`
    is intentionally narrower — no merger/cleanup)
-4. Implement, add tests (incl. an ASCII-smuggling sanitize guard)
-5. Capture connector-specific quirks in `sops/integrations/<name>.md`
+5. Implement, add tests (incl. an ASCII-smuggling sanitize guard)
+6. Capture connector-specific quirks in `sops/integrations/<name>.md`
 
 ### Touching `sdk/core` contracts
 1. Read **every** existing `sdk/integrations/*` package — they all conform

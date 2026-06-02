@@ -41,6 +41,21 @@ work below.
 
 All three: ported, tested, zero `qf-studio/pilot` refs in `sdk/` (verified).
 
+### GitHub connector (M3) — IN FLIGHT (2026-06-02)
+First connector with a non-stdlib dep (`go-github`) → `go.mod`/`go.sum` appear
+in the repo for the first time; `make tidy` + commit both before tagging.
+Triaged the Pilot adapter (29 files): **port** `client`/`types`/`converter`/
+`notifier`/`webhook`/`retry`/`approval_config` then `poller`/`merger`/`cleanup`/
+`adapter`; **drop** `grouping`/`issue_create`/`project_board`/`spec_validator`
+(Pilot-domain — epic refs, `CreatePilotIssue`, board status flips, spec marker).
+
+| Issue | Scope | Labels | State |
+| --- | --- | --- | --- |
+| #28 | client/data (+retry, approval_config) | `pilot,no-decompose` | **In Progress** (daemon) |
+| #29 | poller/merger/cleanup/adapter | `backlog,no-decompose` | held at `NONE`, behind #28 |
+
+Dispatch via the board per [driving-the-sdk-board](../sops/development/driving-the-sdk-board.md).
+
 ### Invariant verification (local)
 - `grep -rn "qf-studio/pilot" sdk/` → no matches.
 - Connectors implement `sdk/core` contracts; loggers injected; only stdlib deps
@@ -72,10 +87,10 @@ Applied across all 3 connectors in one pass:
 
 ## What remains
 
-### Connectors NOT yet extracted (7 / 10)
+### Connectors NOT yet extracted (6 / 10)
 Still in Pilot at `internal/adapters/`:
 
-- `github`
+- `github`     ← **IN FLIGHT** (M3, #28/#29 — see above)
 - `linear`
 - `jira`
 - `asana`
@@ -147,21 +162,25 @@ Don't commit `/tmp/pilot-src`.
 
 ---
 
-## GH Project board state (verified 2026-06-02)
+## GH Project board state (verified 2026-06-02, M3 kickoff)
 
-`gh project item-list 1 --owner qf-studio` → **17 items, all `Done`**.
-No `Todo`, `In Progress`, or `In Review` items. The board is empty of
-queued work; picking up M3 means filing fresh issues using the recipe
-below.
+`gh project item-list 1 --owner qf-studio` → 17 `Done`, plus M3 work:
+- **#28** `In Progress` (daemon building the github client/data PR).
+- **#29** `NONE` + `backlog` (held behind #28).
+- **#26** `NONE` — stale merged-PR card (autopilot leftover, safe to delete).
+- **#27** `NONE` — M7 coordination note, intentionally open.
 
-Missing issue numbers visible in `gh issue list` (#13, #15, #16, #17, #19,
-#21, #23, #25) were PR cards autopilot added with no Status — cleaned up
-per the marker.
+**Intake gate (learned 2026-06-02):** the daemon dispatches from board
+`Status=Todo`, **not** the `pilot` label. A freshly-filed issue sits at
+`NONE` and Pilot stays idle until the card is moved to `Todo`. The local `gh`
+token (`read:project`) can't flip it — use the daemon PAT (GraphQL) or the
+dashboard. Full procedure + IDs:
+[driving-the-sdk-board](../sops/development/driving-the-sdk-board.md).
 
 ## Suggested next pickup
 
-Per the marker: `github` or `linear` (mechanical recipe reuse, both still
-pure issue-poller mold). Either keeps SDK M3/M4 unblocked.
+In flight: `github` (M3). After it merges + tags `v0.10.0`, continue the
+quartet: `linear` → `jira` → `asana` (mechanical recipe reuse).
 
 After the issue-tracker quartet is done, design the chat bridge in `sdk/core`
 before touching `slack`/`telegram`/`discord`.
