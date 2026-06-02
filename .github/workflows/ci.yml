@@ -9,6 +9,14 @@ permissions:
   contents: read
 
 jobs:
+  secret-patterns:
+    name: Check Secret Patterns
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for realistic secret patterns in tracked files
+        run: ./scripts/check-secret-patterns.sh
+
   build-test:
     runs-on: ubuntu-latest
     steps:
