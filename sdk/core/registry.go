@@ -46,7 +46,7 @@ type Poller interface {
 type IssueEvent struct {
 	Action     string // "created", "updated"
 	IssueID    string // Adapter-specific primary ID (UUID, GID, node ID, etc.)
-	SequenceID string // Human-readable number/key within the project (e.g. "42" for Plane, "PROJ-42" for Jira). Used in branch names and PR descriptions. Empty when the adapter has no such concept.
+	SequenceID string // Human-readable, provider-prefixed key used in branch names and PR descriptions (e.g. "GL-42" GitLab, "AZDO-42" Azure DevOps, "PLANE-42" Plane, "PROJ-42" Jira). The prefix keeps IDs distinct across providers in a shared host. Empty when the adapter has no such concept.
 	Title      string
 	Body       string
 	Labels     []string
