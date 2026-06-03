@@ -69,9 +69,10 @@ type PostMessageResponse struct {
 
 // InteractiveMessage represents a message with Block Kit interactive elements.
 type InteractiveMessage struct {
-	Channel string        `json:"channel"`
-	Text    string        `json:"text,omitempty"`
-	Blocks  []interface{} `json:"blocks,omitempty"`
+	Channel  string        `json:"channel"`
+	Text     string        `json:"text,omitempty"`
+	Blocks   []interface{} `json:"blocks,omitempty"`
+	ThreadTS string        `json:"thread_ts,omitempty"`
 }
 
 // InteractionPayload represents a Slack block_actions webhook payload.
