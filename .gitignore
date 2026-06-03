@@ -19,12 +19,12 @@ go.work.sum
 .idea/
 .vscode/
 
-# Navigator context markers
+# Secrets / local environment (never commit these)
+.env
+.env.*
+!.env.example
+
+# Local AI-assistant tooling and internal dev docs (kept out of the public repo)
+.agent/
+.claude/
 .context-markers/
-
-# Navigator temporary files
-.agent/.nav-temp/
-
-# Navigator per-session runtime state (config is committed; these are not)
-.agent/.nav-read-counter.json
-.agent/.nav-workflow-state.json

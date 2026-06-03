@@ -5,7 +5,6 @@
 # push protection blocks branches that contain real-looking credentials, so all
 # test fixtures must use obviously-fake tokens (see sdk/testutil/tokens.go).
 #
-# Adapted from qf-studio/pilot's scripts/check-secret-patterns.sh.
 # Used by CI (.github/workflows/ci.yml job "secret-patterns") and `make check-secrets`.
 
 set -e

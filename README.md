@@ -1,26 +1,28 @@
 # Studio SDK
 
-Reusable Go connectors for Studio projects — issue trackers (GitHub, GitLab,
-Azure DevOps, Linear, Jira, Asana, Plane) and chat platforms (Slack, Telegram,
-Discord), extracted from Pilot so any Studio Go service can consume them.
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/qf-studio/studio-sdk.svg)](https://pkg.go.dev/github.com/qf-studio/studio-sdk)
 
-> **Status:** `v0.24.0` — all 10 connectors shipped. Public API is still `v0.x`
-> (breaking changes allowed until `v1.0.0`).
-> **Distribution:** internal to Studio. Not published publicly.
+Reusable Go connectors for issue trackers (GitHub, GitLab, Azure DevOps, Linear,
+Jira, Asana, Plane) and chat platforms (Slack, Telegram, Discord), behind one
+small contract surface. Wire any of them into a Go service the same way.
+
+> **Status:** `v0.x` — all 10 connectors shipped. The public API is unstable;
+> breaking changes are allowed until `v1.0.0` and are noted in release notes.
 
 ## Design principles
 
-- **Zero Pilot dependency.** The SDK depends only on the Go standard library
-  and a small set of per-connector client deps (see below). Consuming
-  applications wire their own services (scheduler, persistence, metrics, LLM
-  runner) in via the interfaces and callbacks declared in `sdk/core`.
+- **Zero host dependency.** The SDK depends only on the Go standard library and a
+  small set of per-connector client deps (see below). The consuming application
+  wires its own services (scheduler, persistence, metrics, LLM runner) in via the
+  interfaces and callbacks declared in `sdk/core`.
 - **One contract surface.** `sdk/core` owns the issue-tracker contract
   (`Adapter`, `Pollable`, `WebhookCapable`, `Poller`, `IssueEvent`,
   `IssueResult`, `PRCreatedEvent`, the registry) and the chat contract
   (`ChatCapable`, `ChatBridge`, `MessageEvent`, `OutboundMessage`).
 - **Callbacks over imports.** Where a connector needs host behaviour (active-
-  execution listing, sub-issue creation, message handling, metrics), it
-  accepts an interface the host implements — it never imports the host.
+  execution listing, sub-issue creation, message handling, metrics), it accepts
+  an interface the host implements — it never imports the host.
 - **Untrusted text is hostile input.** Anything from a third-party API (issue
   title, PR body, chat message) goes through `sdk/util/text` in the live
   poll/webhook/listener path *before* it can reach an LLM or downstream system.
@@ -66,9 +68,9 @@ sdk/
 ## Runtime dependencies
 
 The core and utility packages are stdlib-only. The only third-party runtime
-dependency in the SDK is `github.com/gorilla/websocket v1.5.3`, pulled in by
-`slack` (Socket Mode) and `discord` (Gateway). Every other connector is
-stdlib-only at runtime.
+dependency in the SDK is `github.com/gorilla/websocket`, pulled in by `slack`
+(Socket Mode) and `discord` (Gateway). Every other connector is stdlib-only at
+runtime.
 
 ## Issue-tracker usage
 
@@ -81,11 +83,11 @@ import (
     "github.com/qf-studio/studio-sdk/sdk/integrations/gitlab"
 )
 
-// 1. Configure a connector. The trigger label/tag is host-neutral.
+// 1. Configure a connector. The trigger label is host-neutral (default "pilot").
 cfg := gitlab.DefaultConfig()
 cfg.Token = os.Getenv("GITLAB_TOKEN")
 cfg.Project = "namespace/project"
-cfg.TriggerLabel = "pilot" // issues with this label are picked up
+cfg.TriggerLabel = "agent" // issues with this label are picked up
 
 // 2. Wire host behaviour via callbacks (the SDK never imports the host).
 deps := core.PollerDeps{
@@ -152,23 +154,25 @@ _ = bridge.Start(context.Background())
 - Lifecycle — `ChatBridge.Start(ctx)` / `Send` / `Edit` / `Ack`
 - Events — `MessageEvent` (Action `"message"`/`"command"`/`"callback"`),
   `Identity`, `OutboundMessage` (Text + `Buttons []Button`), `MessageRef`
-- Host callback — `ChatDeps.HandleMessage`. The bridge **normalizes**
-  commands; it does NOT execute them.
+- Host callback — `ChatDeps.HandleMessage`. The bridge **normalizes** commands;
+  it does NOT execute them.
 
-Adding a connector: see `.agent/sops/integrations/authoring-a-connector.md`.
-Architecture overview: `.agent/system/project-architecture.md`.
-Chat-bridge design: `.agent/system/chat-bridge-design.md`.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design and boundary
+conventions, and [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to add a connector.
 
 ## Roadmap
 
-- **M7 — Pilot cutover** (next): wire Pilot to consume `sdk/integrations/*`
-  instead of `internal/adapters/*`. Behavior-parity risks: `SequenceID` is now
-  provider-prefixed; gitlab/azuredevops `Priority` is newly populated;
-  gitlab/azuredevops `Body` is sanitized. Tracked at issue #27.
-- **M8 — bot template** (later): higher-level scaffolding for "wire a Studio
-  service to one issue tracker + one chat platform" in a single function call.
-- **`v1.0.0`**: API stabilization once M7 has shaken out the contract.
+- **Bot template** — higher-level scaffolding to wire one issue tracker + one
+  chat platform into a service in a single call.
+- **`v1.0.0`** — API stabilization once the contract has been exercised across
+  real workloads.
+
+## Security
+
+Please report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md).
+Untrusted third-party text is sanitized via `sdk/util/text` in every connector's
+live path before it reaches a host or an LLM.
 
 ## License
 
-Internal — Studio projects only.
+[Apache License 2.0](LICENSE) © qf-studio.

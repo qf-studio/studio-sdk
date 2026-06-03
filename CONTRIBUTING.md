@@ -1,0 +1,92 @@
+# Contributing
+
+Thanks for your interest in Studio SDK. This guide covers the local workflow,
+the quality gates, and how to add a new connector.
+
+Read `ARCHITECTURE.md` first — the contract surface and boundary conventions
+there are load-bearing.
+
+## Development workflow
+
+```bash
+git clone https://github.com/qf-studio/studio-sdk
+cd studio-sdk
+
+make build   # go build ./...
+make test    # go test -race ./...
+make lint    # go vet ./... + golangci-lint run (if installed)
+make fmt     # gofmt -w .
+make tidy    # go mod tidy
+```
+
+Go 1.24+ is required. Run `make test` before opening a PR on any non-doc change.
+
+## Code standards
+
+- **Stdlib first.** Reach for a third-party library only inside the specific
+  connector that needs it — never in `sdk/core`, `sdk/log`, `sdk/util/*`, or
+  `sdk/testutil`.
+- **Errors as values.** No panics in library code; wrap with `%w`.
+- **Inject the logger.** A `*slog.Logger` satisfies `sdk/log.Logger`; don't
+  hardcode `slog.Default()` at package level.
+- **Never hardcode secrets or tokens.** Tests use the obviously-fake constants in
+  `sdk/testutil`.
+- `gofmt` and `go vet` must be clean; `go test -race ./...` must pass.
+
+## Commits
+
+Conventional Commits: `type(scope): description`, where `scope` is the package
+touched (`core`, `gitlab`, `testutil`, ...) and `type` is one of `feat`, `fix`,
+`docs`, `refactor`, `test`, `chore`. Call out any breaking `sdk/core` contract
+change explicitly in the message — downstream hosts depend on it.
+
+## Adding a connector
+
+A connector lives in `sdk/integrations/<name>` and conforms to the `sdk/core`
+contract; it does not extend it. Use an existing connector of the same kind as a
+structural reference:
+
+- **Issue tracker** — see `gitlab` or `azuredevops` (full poll + webhook +
+  merger/cleanup); `plane` is intentionally narrower (poll only).
+- **Chat platform** — see `telegram` (long-poll, stdlib-only), `slack`
+  (Socket Mode WS), or `discord` (Gateway WS).
+
+Typical split:
+
+1. **Client / data layer** — `client.go`, `types.go`, and `sanitize.go`
+   (+ tests). The client wraps the provider API; types model its payloads;
+   `sanitize.go` wraps `sdk/util/text` for inbound untrusted text.
+2. **Behavior layer** — for issue trackers: `poller.go`, `webhook.go`,
+   `adapter.go` (+ optional `merger.go`/`cleanup.go`); for chat: `transport.go`,
+   `bridge.go`, `adapter.go`.
+
+### Acceptance gates (must all pass)
+
+- `go build ./...` is green.
+- `go test -race ./sdk/integrations/<name>/...` is green.
+- `go vet ./...` is clean and `gofmt -l sdk/` is empty.
+- `go mod tidy` is a no-op (or, if the connector adds a client dep, `go.mod` and
+  `go.sum` are committed together and `go.mod` requires only what's used).
+- No third-party deps added to `sdk/core`, `sdk/log`, `sdk/util/*`, `sdk/testutil`.
+- Logger is injected, not package-global.
+- The native payload → `core.IssueEvent` / `core.MessageEvent` mapping doesn't
+  silently drop fields.
+- **Untrusted text is sanitized in the live path** — the poll/webhook/listener
+  loop runs the connector's `sanitize*` helper before emitting a normalized event.
+  Add a test that smuggles invisible-Unicode characters and asserts they're stripped.
+
+### For chat connectors specifically
+
+- Compile-time conformance: `var _ core.Adapter = (*Adapter)(nil)` and
+  `var _ core.ChatCapable = (*Adapter)(nil)`.
+- `Name()` returns the connector name.
+- The `Start` loop sanitizes inbound `Text` before emitting `core.MessageEvent`.
+- Commands emit `Action:"command"` with `Command`/`Args` — the connector does
+  **not** execute them.
+- `Send` renders `OutboundMessage.Buttons` using the platform's native control
+  (Block Kit actions, inline keyboards, action rows).
+
+## Reporting bugs and security issues
+
+- Functional bugs: open a GitHub issue with a minimal reproduction.
+- Security vulnerabilities: **do not** open a public issue — follow `SECURITY.md`.
