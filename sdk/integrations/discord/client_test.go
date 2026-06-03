@@ -408,6 +408,93 @@ func TestContextCancellation(t *testing.T) {
 	}
 }
 
+func TestGetGatewayURLSuccess(t *testing.T) {
+	transport := &mockTransport{
+		handler: func(req *http.Request) (*http.Response, error) {
+			if req.Method != http.MethodGet {
+				t.Errorf("method = %q, want GET", req.Method)
+			}
+			if !strings.HasSuffix(req.URL.Path, "/gateway") {
+				t.Errorf("path = %q, want suffix /gateway", req.URL.Path)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"url":"wss://gateway.discord.gg"}`)),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+
+	c := &Client{
+		botToken:   testutil.FakeDiscordToken,
+		baseURL:    DiscordAPIURL,
+		httpClient: &http.Client{Transport: transport},
+		maxRetries: 3,
+	}
+
+	got, err := c.GetGatewayURL(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "wss://gateway.discord.gg" {
+		t.Errorf("url = %q, want wss://gateway.discord.gg", got)
+	}
+}
+
+func TestGetGatewayURLEmpty(t *testing.T) {
+	transport := &mockTransport{
+		handler: func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"url":""}`)),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+
+	c := &Client{
+		botToken:   testutil.FakeDiscordToken,
+		baseURL:    DiscordAPIURL,
+		httpClient: &http.Client{Transport: transport},
+		maxRetries: 0,
+	}
+
+	_, err := c.GetGatewayURL(context.Background())
+	if err == nil {
+		t.Fatal("expected error on empty URL, got nil")
+	}
+	if !strings.Contains(err.Error(), "empty gateway URL") {
+		t.Errorf("error = %q, want 'empty gateway URL'", err.Error())
+	}
+}
+
+func TestGetGatewayURLHTTPError(t *testing.T) {
+	transport := &mockTransport{
+		handler: func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       io.NopCloser(strings.NewReader(`{"message":"401: Unauthorized"}`)),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+
+	c := &Client{
+		botToken:   testutil.FakeDiscordToken,
+		baseURL:    DiscordAPIURL,
+		httpClient: &http.Client{Transport: transport},
+		maxRetries: 0,
+	}
+
+	_, err := c.GetGatewayURL(context.Background())
+	if err == nil {
+		t.Fatal("expected error on 401, got nil")
+	}
+	if !strings.Contains(err.Error(), "HTTP 401") {
+		t.Errorf("error = %q, want HTTP 401", err.Error())
+	}
+}
+
 func TestParseRetryAfter(t *testing.T) {
 	tests := []struct {
 		name     string
