@@ -5,7 +5,7 @@
 **Driver:** Pilot drives studio-sdk via the GH Project board "Studio SDK"
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
-**Current tag:** `v0.18.0` — **issue-tracker quartet COMPLETE** (github `v0.10/0.11`, linear `v0.12/0.13`, jira `v0.14/0.15`, asana `v0.16/0.17`) + **chat-bridge contract landed** in `sdk/core` (`v0.18.0`, #47). 7/10 connectors done; chat trio next (telegram in flight).
+**Current tag:** `v0.20.0` — issue-tracker quartet COMPLETE (`v0.10`–`v0.17`) + chat-bridge contract in `sdk/core` (`v0.18.0`, #47) + **telegram chat reference COMPLETE** (`v0.19/0.20`, #49/#50). **8/10 connectors done.** Remaining: slack + discord (pending operator review of the telegram reference).
 **Releases are daemon-automated:** the Pilot daemon auto-tags a release on every
 merge to main (`release: version_strategy: conventional_commits, tag_prefix: v`
 in `~/.pilot/config.yaml`) → one minor bump *per merged PR*, as lightweight tags.
@@ -116,15 +116,18 @@ Applied across all 3 connectors in one pass:
 to the issue contract (approved spec in `system/chat-bridge-design.md`; outbound
 = Text + Buttons; inbound = `ChatBridge.Start(ctx)` listener). Stdlib-only.
 
-- `telegram`  ← **IN FLIGHT** (reference port — simplest delivery: long-poll)
-- `slack`     ← chat — Block Kit + Socket Mode; **checkpoint after telegram**
-- `discord`   ← chat — Gateway WS; **checkpoint after telegram**
+- `telegram`  ← **DONE** (`v0.19/0.20`, #49/#50) — reference; proves the contract
+- `slack`     ← chat — Block Kit + Socket Mode (WS) + interaction webhook
+- `discord`   ← chat — Gateway WS (reconnect/resume)
 
-The chat ports are NOT mechanical recipe reuse. telegram proves the contract;
-the operator reviews before slack/discord. Chat config is `BotToken` + an
-ID allow-list (not the issue `TriggerLabel`). Drop Pilot host-domain
-(intent/executor/memory/briefs/transcription, command EXECUTION → emit
-`MessageEvent{Action:"command"}` and let the host decide).
+**CHECKPOINT (2026-06-03):** the telegram reference validated the chat contract
+end-to-end (`ChatBridge.Start/Send/Edit/Ack`, message/command/callback mapping,
+inbound sanitize in the Start loop, Buttons→inline keyboard). slack/discord are
+NOT mechanical — heavier delivery (Socket Mode / Gateway). **Awaiting operator
+go-ahead before porting them.** Recipe when resumed: same 2-issue split
+(client/data+bridge), drop Pilot host-domain (intent/executor/memory/briefs/
+transcription, command execution → emit `Action:"command"`), config = `BotToken`
++ allow-list, sanitize inbound text in the live listen path.
 
 Issue-tracker quartet (`github`, `linear`, `jira`, `asana`) is mechanical
 reuse of the proven recipe. Chat trio needs an `sdk/core` bridge designed
