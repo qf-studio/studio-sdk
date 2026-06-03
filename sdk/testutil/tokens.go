@@ -25,4 +25,6 @@ const (
 	FakeAsanaToken         = "test-asana-token"
 	FakeAsanaWebhookSecret = "test-asana-webhook-secret"
 	FakeAsanaWorkspaceID   = "test-asana-workspace-id"
+
+	FakeTelegramToken = "test-telegram-token"
 )
