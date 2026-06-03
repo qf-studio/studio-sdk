@@ -215,6 +215,24 @@ func (c *Client) SendMessageWithComponents(ctx context.Context, channelID, conte
 	return &msg, nil
 }
 
+// GetGatewayURL fetches the WebSocket gateway URL from the Discord REST API.
+func (c *Client) GetGatewayURL(ctx context.Context) (string, error) {
+	resp, err := c.doRequest(ctx, http.MethodGet, "/gateway", nil)
+	if err != nil {
+		return "", fmt.Errorf("get gateway url: %w", err)
+	}
+	var result struct {
+		URL string `json:"url"`
+	}
+	if err := json.Unmarshal(resp, &result); err != nil {
+		return "", fmt.Errorf("parse gateway response: %w", err)
+	}
+	if result.URL == "" {
+		return "", fmt.Errorf("discord: empty gateway URL in response")
+	}
+	return result.URL, nil
+}
+
 // CreateInteractionResponse acknowledges an interaction (e.g. a button click).
 func (c *Client) CreateInteractionResponse(ctx context.Context, interactionID, interactionToken string, responseType int, content string) error {
 	payload := struct {
