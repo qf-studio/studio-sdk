@@ -31,4 +31,6 @@ const (
 	FakeSlackBotToken      = "test-slack-bot-token"
 	FakeSlackAppToken      = "test-slack-app-token"
 	FakeSlackSigningSecret = "test-slack-signing-secret"
+
+	FakeDiscordToken = "test-discord-token"
 )
