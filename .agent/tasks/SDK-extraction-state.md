@@ -6,7 +6,16 @@
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
 
-**Current tag:** `v0.24.0` — **SDK extraction COMPLETE (10/10 connectors).**
+**Current tag:** `v0.25.0` — **SDK extraction COMPLETE (10/10 connectors)** + M7 executor-interface hardening.
+
+**M7-prep audit (2026-06-03, `v0.25.0`):** audited every connector against the
+three executor-implemented interfaces Pilot injects (`PRCreator`,
+`SubIssueCreator`, `SubIssueLinker`). Demand = 4 wiring sites in Pilot
+(`handlers.go:548` linear SubIssueCreator, `:1034` plane SubIssueCreator,
+`:1145` gitlab PRCreator, `main.go:753` github SubIssueLinker). Result: 3/4
+already matched; **linear had dropped `CreateIssue` in extraction → restored
+(`feat(linear)`)**. jira/asana never had it (no gap); azuredevops matches
+in-tree. The SDK now satisfies all three host interfaces via structural typing.
 - Issue-tracker quartet: github (`v0.10/0.11`), linear (`v0.12/0.13`), jira (`v0.14/0.15`), asana (`v0.16/0.17`).
 - Chat-bridge contract in `sdk/core/chat.go` (`v0.18.0`, #47).
 - Chat trio: telegram (`v0.19/0.20`, #49/#50) — long-poll; slack (`v0.21/0.22`, #54/#55) — Socket Mode WS; discord (`v0.23/0.24`, #59/#60) — Gateway WS.
