@@ -5,7 +5,7 @@
 **Driver:** Pilot drives studio-sdk via the GH Project board "Studio SDK"
 (`github.com/orgs/qf-studio/projects/1`). Auto-add workflow ON for studio-sdk
 issues+PRs.
-**Current tag:** `v0.20.0` — issue-tracker quartet COMPLETE (`v0.10`–`v0.17`) + chat-bridge contract in `sdk/core` (`v0.18.0`, #47) + **telegram chat reference COMPLETE** (`v0.19/0.20`, #49/#50). **8/10 connectors done.** Remaining: slack + discord (pending operator review of the telegram reference).
+**Current tag:** `v0.22.0` — issue-tracker quartet (`v0.10`–`v0.17`) + chat contract (`v0.18`) + telegram (`v0.19/0.20`) + **slack COMPLETE** (`v0.21/0.22`, #54/#55). **9/10 connectors done.** discord (#59/#60) in flight = the last. **First SDK runtime dep landed with slack: `gorilla/websocket` v1.5.3** (Socket Mode), isolated to the connector; `sdk/{core,log,util,testutil}` stay stdlib-only. discord reuses the same dep (Gateway WS).
 **Releases are daemon-automated:** the Pilot daemon auto-tags a release on every
 merge to main (`release: version_strategy: conventional_commits, tag_prefix: v`
 in `~/.pilot/config.yaml`) → one minor bump *per merged PR*, as lightweight tags.
@@ -116,9 +116,9 @@ Applied across all 3 connectors in one pass:
 to the issue contract (approved spec in `system/chat-bridge-design.md`; outbound
 = Text + Buttons; inbound = `ChatBridge.Start(ctx)` listener). Stdlib-only.
 
-- `telegram`  ← **DONE** (`v0.19/0.20`, #49/#50) — reference; proves the contract
-- `slack`     ← chat — Block Kit + Socket Mode (WS) + interaction webhook
-- `discord`   ← chat — Gateway WS (reconnect/resume)
+- `telegram`  ← **DONE** (`v0.19/0.20`, #49/#50) — reference; long-poll
+- `slack`     ← **DONE** (`v0.21/0.22`, #54/#55) — Socket Mode WS; first ext dep
+- `discord`   ← **IN FLIGHT** (#59/#60) — Gateway WS; reuses gorilla/websocket; LAST connector
 
 **CHECKPOINT (2026-06-03):** the telegram reference validated the chat contract
 end-to-end (`ChatBridge.Start/Send/Edit/Ack`, message/command/callback mapping,
