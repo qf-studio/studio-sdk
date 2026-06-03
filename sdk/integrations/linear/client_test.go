@@ -547,6 +547,133 @@ func TestClientMethodSignatures(t *testing.T) {
 	_ = err
 }
 
+// subIssueCreator mirrors the host's sub-issue-creator contract (e.g. Pilot's
+// executor.SubIssueCreator). Asserting *Client against it locks the CreateIssue
+// signature so a future refactor can't silently break host integration — without
+// the SDK importing the host.
+type subIssueCreator interface {
+	CreateIssue(ctx context.Context, parentID, title, body string, labels []string) (string, string, error)
+}
+
+var _ subIssueCreator = (*Client)(nil)
+
+func TestCreateIssue_Success(t *testing.T) {
+	var sawGetIssue, sawLabelLookup, sawCreate bool
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+
+		switch {
+		case contains(reqBody.Query, "issue(id: $id)"):
+			sawGetIssue = true
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{
+				"issue": {
+					"id": "parent-1",
+					"identifier": "ENG-100",
+					"title": "Parent epic",
+					"team": {"id": "team-1", "name": "Engineering", "key": "ENG"},
+					"project": {"id": "project-1", "name": "Main"}
+				}
+			}`)})
+
+		case contains(reqBody.Query, "issueLabels"):
+			// GetOrCreateLabel → GetLabelByName: return a hit so we skip creation.
+			sawLabelLookup = true
+			if reqBody.Variables["teamId"] != "ENG" {
+				t.Errorf("label lookup teamId = %v, want ENG (team key)", reqBody.Variables["teamId"])
+			}
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{
+				"issueLabels": {"nodes": [{"id": "label-pilot", "name": "Pilot"}]}
+			}`)})
+
+		case contains(reqBody.Query, "issueCreate"):
+			sawCreate = true
+			if reqBody.Variables["teamId"] != "team-1" {
+				t.Errorf("issueCreate teamId = %v, want team-1 (team UUID)", reqBody.Variables["teamId"])
+			}
+			if reqBody.Variables["projectId"] != "project-1" {
+				t.Errorf("issueCreate projectId = %v, want project-1", reqBody.Variables["projectId"])
+			}
+			if desc, _ := reqBody.Variables["description"].(string); !contains(desc, "Parent: parent-1") {
+				t.Errorf("description = %q, want a 'Parent: parent-1' reference", desc)
+			}
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{
+				"issueCreate": {
+					"success": true,
+					"issue": {"id": "child-1", "identifier": "ENG-124", "url": "https://linear.app/eng/issue/ENG-124"}
+				}
+			}`)})
+
+		default:
+			t.Fatalf("unexpected query: %s", reqBody.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	id, url, err := client.CreateIssue(context.Background(), "parent-1", "Child task", "do the thing", nil)
+	if err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+	if id != "ENG-124" {
+		t.Errorf("identifier = %q, want ENG-124", id)
+	}
+	if url != "https://linear.app/eng/issue/ENG-124" {
+		t.Errorf("url = %q, want the issue URL", url)
+	}
+	if !sawGetIssue || !sawLabelLookup || !sawCreate {
+		t.Errorf("missing call: getIssue=%v labelLookup=%v create=%v", sawGetIssue, sawLabelLookup, sawCreate)
+	}
+}
+
+func TestCreateIssue_ParentFetchError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// issue(id) returns null → GetIssue surfaces a not-found error.
+		_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{"issue": null}`)})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	_, _, err := client.CreateIssue(context.Background(), "missing", "t", "b", nil)
+	if err == nil {
+		t.Fatal("expected error when parent issue cannot be fetched, got nil")
+	}
+}
+
+func TestCreateIssue_MutationUnsuccessful(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		_ = json.NewDecoder(r.Body).Decode(&reqBody)
+		switch {
+		case contains(reqBody.Query, "issue(id: $id)"):
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{
+				"issue": {"id": "p", "identifier": "ENG-1", "team": {"id": "t", "key": "ENG"}}
+			}`)})
+		case contains(reqBody.Query, "issueLabels"):
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{
+				"issueLabels": {"nodes": [{"id": "l", "name": "Pilot"}]}
+			}`)})
+		default: // issueCreate returns success=false
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{
+				"issueCreate": {"success": false, "issue": {"id": "", "identifier": "", "url": ""}}
+			}`)})
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	_, _, err := client.CreateIssue(context.Background(), "p", "t", "b", nil)
+	if err == nil {
+		t.Fatal("expected error when issueCreate returns success=false, got nil")
+	}
+}
+
 // testableClient wraps Client methods with custom URL support for testing.
 type testableClient struct {
 	apiKey     string

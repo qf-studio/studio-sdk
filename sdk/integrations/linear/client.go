@@ -481,6 +481,96 @@ func (c *Client) GetOrCreateLabel(ctx context.Context, teamID, labelName, color 
 	return c.CreateLabel(ctx, teamID, labelName, color)
 }
 
+// CreateIssue creates a child issue under parentID, deriving team/project context
+// from the parent. It tags the new issue with the "Pilot" label (plus any
+// caller-supplied labels) and prepends a parent reference to the body. It returns
+// the new issue's identifier (e.g. "APP-124") and URL.
+//
+// The signature matches the host's sub-issue-creator contract (e.g. Pilot's
+// executor.SubIssueCreator) so a *Client satisfies it via structural typing —
+// the SDK does not import the host.
+func (c *Client) CreateIssue(ctx context.Context, parentID, title, body string, labels []string) (string, string, error) {
+	// Fetch parent issue to get team/project context.
+	parent, err := c.GetIssue(ctx, parentID)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to fetch parent issue %s: %w", parentID, err)
+	}
+
+	// Build body with parent reference.
+	bodyWithParent := fmt.Sprintf("Parent: %s\n\n%s", parentID, body)
+
+	// Get or create the "Pilot" label.
+	pilotLabelID, err := c.GetOrCreateLabel(ctx, parent.Team.Key, "Pilot", "#7ec699")
+	if err != nil {
+		return "", "", fmt.Errorf("failed to get/create Pilot label: %w", err)
+	}
+
+	// Collect all label IDs.
+	labelIDs := []string{pilotLabelID}
+	for _, labelName := range labels {
+		if labelName != "Pilot" { // Avoid duplicates.
+			labelID, err := c.GetOrCreateLabel(ctx, parent.Team.Key, labelName, "#8b949e")
+			if err != nil {
+				return "", "", fmt.Errorf("failed to get/create label %s: %w", labelName, err)
+			}
+			labelIDs = append(labelIDs, labelID)
+		}
+	}
+
+	// Create the issue via the issueCreate mutation.
+	mutation := `
+		mutation CreateIssue($teamId: String!, $title: String!, $description: String, $labelIds: [String!], $projectId: String) {
+			issueCreate(input: {
+				teamId: $teamId,
+				title: $title,
+				description: $description,
+				labelIds: $labelIds,
+				projectId: $projectId
+			}) {
+				success
+				issue {
+					id
+					identifier
+					url
+				}
+			}
+		}
+	`
+
+	variables := map[string]interface{}{
+		"teamId":      parent.Team.ID,
+		"title":       title,
+		"description": bodyWithParent,
+		"labelIds":    labelIDs,
+	}
+
+	// Include the project if the parent has one.
+	if parent.Project != nil {
+		variables["projectId"] = parent.Project.ID
+	}
+
+	var result struct {
+		IssueCreate struct {
+			Success bool `json:"success"`
+			Issue   struct {
+				ID         string `json:"id"`
+				Identifier string `json:"identifier"`
+				URL        string `json:"url"`
+			} `json:"issue"`
+		} `json:"issueCreate"`
+	}
+
+	if err := c.Execute(ctx, mutation, variables, &result); err != nil {
+		return "", "", fmt.Errorf("failed to create issue: %w", err)
+	}
+
+	if !result.IssueCreate.Success {
+		return "", "", fmt.Errorf("issueCreate returned success=false")
+	}
+
+	return result.IssueCreate.Issue.Identifier, result.IssueCreate.Issue.URL, nil
+}
+
 // GetTeamDoneStateID returns the cached "completed" workflow state ID for a team.
 // It queries the Linear API on first call and caches the result.
 func (c *Client) GetTeamDoneStateID(ctx context.Context, teamKey string) (string, error) {
