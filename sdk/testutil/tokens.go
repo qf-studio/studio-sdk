@@ -27,4 +27,8 @@ const (
 	FakeAsanaWorkspaceID   = "test-asana-workspace-id"
 
 	FakeTelegramToken = "test-telegram-token"
+
+	FakeSlackBotToken      = "test-slack-bot-token"
+	FakeSlackAppToken      = "test-slack-app-token"
+	FakeSlackSigningSecret = "test-slack-signing-secret"
 )
