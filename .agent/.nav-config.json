@@ -10,7 +10,7 @@
   "auto_update": {
     "enabled": true,
     "check_interval_hours": 1,
-    "last_check": "2026-06-02T16:11:34.106031"
+    "last_check": "2026-06-03T11:36:58.852111"
   },
   "session_start_hook": {
     "enabled": true,

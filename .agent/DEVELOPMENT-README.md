@@ -2,7 +2,8 @@
 
 **Project**: Reusable Go connectors for Studio projects (issue trackers + chat platforms), extracted from Pilot.
 **Tech Stack**: Go 1.24 (stdlib-only core; per-integration client deps)
-**Updated**: 2026-06-02
+**Status**: `v0.24.0` — **all 10 connectors shipped** (7 issue trackers + 3 chat + the chat contract). Next phase: M7 Pilot cutover.
+**Updated**: 2026-06-03
 
 ---
 
@@ -110,5 +111,5 @@ These are load-bearing — every change should respect them:
 
 ---
 
-**Last Updated**: 2026-06-02
+**Last Updated**: 2026-06-03
 **Powered By**: Navigator 6.15.5
