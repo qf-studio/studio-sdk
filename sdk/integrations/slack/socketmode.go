@@ -281,20 +281,6 @@ func NewSocketModeClient(appToken string, logger *slog.Logger) *SocketModeClient
 	}
 }
 
-// newSocketModeClientForTest creates a client with a custom API base URL and dialer.
-func newSocketModeClientForTest(appToken, apiURL string, d wsDialer, logger *slog.Logger) *SocketModeClient {
-	if logger == nil {
-		logger = slog.Default()
-	}
-	return &SocketModeClient{
-		appToken:   appToken,
-		apiURL:     apiURL,
-		httpClient: &http.Client{Timeout: 5 * time.Second},
-		dialer:     d,
-		log:        logger,
-	}
-}
-
 // OpenConnection calls apps.connections.open with the app-level token and
 // returns the WebSocket URL for event streaming.
 func (s *SocketModeClient) OpenConnection(ctx context.Context) (string, error) {
