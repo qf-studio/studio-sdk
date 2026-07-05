@@ -3,6 +3,7 @@ package github
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -3562,5 +3563,390 @@ func TestDoRequest_ReplayBodyOnRetry(t *testing.T) {
 		if !strings.Contains(body, "hello") {
 			t.Errorf("attempt %d body %q does not contain 'hello'", i+1, body)
 		}
+	}
+}
+
+func TestCompareStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		response   string
+		wantStatus string
+		wantErr    bool
+	}{
+		{
+			name:       "ahead",
+			statusCode: http.StatusOK,
+			response:   `{"status":"ahead"}`,
+			wantStatus: "ahead",
+		},
+		{
+			name:       "identical",
+			statusCode: http.StatusOK,
+			response:   `{"status":"identical"}`,
+			wantStatus: "identical",
+		},
+		{
+			name:       "not found",
+			statusCode: http.StatusNotFound,
+			response:   `{"message":"Not Found"}`,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %s", r.Method)
+				}
+				if r.URL.Path != "/repos/owner/repo/compare/main...feature" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+			status, err := client.CompareStatus(context.Background(), "owner", "repo", "main", "feature")
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("CompareStatus() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && status != tt.wantStatus {
+				t.Errorf("CompareStatus() = %q, want %q", status, tt.wantStatus)
+			}
+		})
+	}
+}
+
+func TestSearchOpenPRsForIssue(t *testing.T) {
+	tests := []struct {
+		name          string
+		statusCode    int
+		response      string
+		wantErr       bool
+		wantPRNums    []int
+		wantUserLogin string
+	}{
+		{
+			name:          "open PRs found with author",
+			statusCode:    http.StatusOK,
+			response:      `{"items":[{"id":1,"number":42,"title":"Fix bug","state":"open","html_url":"https://github.com/owner/repo/pull/42","user":{"id":9,"login":"pilot-bot"}}]}`,
+			wantPRNums:    []int{42},
+			wantUserLogin: "pilot-bot",
+		},
+		{
+			name:       "no open PRs",
+			statusCode: http.StatusOK,
+			response:   `{"items":[]}`,
+			wantPRNums: nil,
+		},
+		{
+			name:       "server error",
+			statusCode: http.StatusInternalServerError,
+			response:   `{"message":"error"}`,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %s", r.Method)
+				}
+				if !strings.HasPrefix(r.URL.Path, "/search/issues") {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				q := r.URL.Query().Get("q")
+				if !strings.Contains(q, "is:open") {
+					t.Errorf("query %q missing is:open", q)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+			prs, err := client.SearchOpenPRsForIssue(context.Background(), "owner", "repo", 42)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("SearchOpenPRsForIssue() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(prs) != len(tt.wantPRNums) {
+				t.Fatalf("SearchOpenPRsForIssue() returned %d PRs, want %d", len(prs), len(tt.wantPRNums))
+			}
+			for i, num := range tt.wantPRNums {
+				if prs[i].Number != num {
+					t.Errorf("prs[%d].Number = %d, want %d", i, prs[i].Number, num)
+				}
+			}
+			if tt.wantUserLogin != "" {
+				if prs[0].User == nil || prs[0].User.Login != tt.wantUserLogin {
+					t.Errorf("prs[0].User = %+v, want login %q", prs[0].User, tt.wantUserLogin)
+				}
+			}
+		})
+	}
+}
+
+func TestGetAuthenticatedUser(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		response   string
+		wantLogin  string
+		wantErr    bool
+	}{
+		{
+			name:       "success",
+			statusCode: http.StatusOK,
+			response:   `{"id":1,"login":"pilot-bot"}`,
+			wantLogin:  "pilot-bot",
+		},
+		{
+			name:       "unauthorized",
+			statusCode: http.StatusUnauthorized,
+			response:   `{"message":"Bad credentials"}`,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %s", r.Method)
+				}
+				if r.URL.Path != "/user" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+			user, err := client.GetAuthenticatedUser(context.Background())
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("GetAuthenticatedUser() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && user.Login != tt.wantLogin {
+				t.Errorf("user.Login = %q, want %q", user.Login, tt.wantLogin)
+			}
+		})
+	}
+}
+
+func TestFindOpenPRByBranch(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		response   string
+		wantFound  bool
+		wantErr    bool
+	}{
+		{
+			name:       "open PR on branch",
+			statusCode: http.StatusOK,
+			response:   `[{"number":42,"state":"open","head":{"ref":"pilot/GH-72"}}]`,
+			wantFound:  true,
+		},
+		{
+			name:       "no open PR on branch",
+			statusCode: http.StatusOK,
+			response:   `[]`,
+			wantFound:  false,
+		},
+		{
+			name:       "server error",
+			statusCode: http.StatusInternalServerError,
+			response:   `{"message":"error"}`,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("expected GET, got %s", r.Method)
+				}
+				if !strings.HasPrefix(r.URL.Path, "/repos/owner/repo/pulls") {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+				}
+				if r.URL.Query().Get("state") != "open" {
+					t.Errorf("expected state=open, got %s", r.URL.Query().Get("state"))
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+			found, err := client.FindOpenPRByBranch(context.Background(), "owner", "repo", "pilot/GH-72")
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("FindOpenPRByBranch() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && found != tt.wantFound {
+				t.Errorf("FindOpenPRByBranch() = %v, want %v", found, tt.wantFound)
+			}
+		})
+	}
+}
+
+// TestExecuteGraphQL_RetriesOnServerError verifies ExecuteGraphQL now shares
+// executeGraphQLCore's WithRetryVoid wrapping (it previously had no retry at all).
+func TestExecuteGraphQL_RetriesOnServerError(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"login":"octocat"}}}`))
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	client.retryOpts = RetryOptions{MaxRetries: 3, BaseDelay: 1 * time.Millisecond, MaxDelay: 10 * time.Millisecond}
+
+	var result map[string]interface{}
+	err := client.ExecuteGraphQL(context.Background(), `query { viewer { login } }`, nil, &result)
+	if err != nil {
+		t.Fatalf("ExecuteGraphQL() error = %v, want nil after retry", err)
+	}
+	if calls != 2 {
+		t.Errorf("server called %d times, want 2 (1 initial + 1 retry)", calls)
+	}
+}
+
+func TestExecuteGraphQLTolerant(t *testing.T) {
+	tests := []struct {
+		name            string
+		response        string
+		wantErr         bool
+		wantPartial     bool
+		wantDataApplied bool
+	}{
+		{
+			name:            "all tolerable errors - data unmarshalled + partial error",
+			response:        `{"data":{"x":1},"errors":[{"message":"not found","type":"NOT_FOUND"},{"message":"forbidden","type":"FORBIDDEN"}]}`,
+			wantErr:         true,
+			wantPartial:     true,
+			wantDataApplied: true,
+		},
+		{
+			name:            "mixed tolerable+fatal - hard failure, no partial unmarshal",
+			response:        `{"data":{"x":1},"errors":[{"message":"not found","type":"NOT_FOUND"},{"message":"rate limit","type":"RATE_LIMITED"}]}`,
+			wantErr:         true,
+			wantPartial:     false,
+			wantDataApplied: false,
+		},
+		{
+			name:     "no errors - success",
+			response: `{"data":{"x":1}}`,
+			wantErr:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+
+			var result struct {
+				X int `json:"x"`
+			}
+			err := client.ExecuteGraphQLTolerant(context.Background(), `query { x }`, nil, &result)
+
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ExecuteGraphQLTolerant() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			var partialErr *PartialGraphQLError
+			isPartial := errors.As(err, &partialErr)
+			if isPartial != tt.wantPartial {
+				t.Errorf("errors.As(*PartialGraphQLError) = %v, want %v (err=%v)", isPartial, tt.wantPartial, err)
+			}
+
+			if tt.wantDataApplied && result.X != 1 {
+				t.Errorf("result.X = %d, want 1 (data should be unmarshalled)", result.X)
+			}
+			if !tt.wantDataApplied && tt.wantErr && result.X != 0 {
+				t.Errorf("result.X = %d, want 0 (data should NOT be unmarshalled on fatal error)", result.X)
+			}
+		})
+	}
+}
+
+// TestExecuteGraphQLTolerant_RateLimitedRetried verifies a RATE_LIMITED GraphQL
+// error (HTTP 200 + GraphQL-level error) is retried, matching Pilot semantics.
+func TestExecuteGraphQLTolerant_RateLimitedRetried(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusOK)
+		if calls == 1 {
+			_, _ = w.Write([]byte(`{"data":null,"errors":[{"message":"rate limit exceeded","type":"RATE_LIMITED"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"data":{"x":1}}`))
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	client.retryOpts = RetryOptions{MaxRetries: 3, BaseDelay: 1 * time.Millisecond, MaxDelay: 10 * time.Millisecond}
+
+	var result struct {
+		X int `json:"x"`
+	}
+	err := client.ExecuteGraphQLTolerant(context.Background(), `query { x }`, nil, &result)
+	if err != nil {
+		t.Fatalf("ExecuteGraphQLTolerant() error = %v, want nil after retry", err)
+	}
+	if calls != 2 {
+		t.Errorf("server called %d times, want 2 (1 initial RATE_LIMITED + 1 retry)", calls)
+	}
+	if result.X != 1 {
+		t.Errorf("result.X = %d, want 1", result.X)
+	}
+}
+
+func TestIsTolerable(t *testing.T) {
+	tests := []struct {
+		errType string
+		want    bool
+	}{
+		{"NOT_FOUND", true},
+		{"FORBIDDEN", true},
+		{"RATE_LIMITED", false},
+		{"", false},
+		{"SOME_OTHER_ERROR", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.errType, func(t *testing.T) {
+			if got := isTolerable(tt.errType); got != tt.want {
+				t.Errorf("isTolerable(%q) = %v, want %v", tt.errType, got, tt.want)
+			}
+		})
 	}
 }

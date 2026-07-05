@@ -31,7 +31,47 @@ type GraphQLResponse struct {
 
 // GraphQLError is a single error from a GraphQL response.
 type GraphQLError struct {
-	Message string `json:"message"`
+	Message string        `json:"message"`
+	Type    string        `json:"type,omitempty"`
+	Path    []interface{} `json:"path,omitempty"`
+}
+
+// String renders a GraphQLError with its type/path when present, for diagnostics.
+func (e GraphQLError) String() string {
+	s := e.Message
+	if e.Type != "" {
+		s = e.Type + ": " + s
+	}
+	if len(e.Path) > 0 {
+		parts := make([]string, len(e.Path))
+		for i, p := range e.Path {
+			parts[i] = fmt.Sprintf("%v", p)
+		}
+		s += " (path: " + strings.Join(parts, ".") + ")"
+	}
+	return s
+}
+
+// PartialGraphQLError is returned by ExecuteGraphQLTolerant when the response
+// contains only tolerable per-node errors (NOT_FOUND, FORBIDDEN). Data has been
+// unmarshalled into result; callers can inspect the dropped-node details via Errors.
+type PartialGraphQLError struct {
+	Errors []GraphQLError
+}
+
+func (e *PartialGraphQLError) Error() string {
+	msgs := make([]string, len(e.Errors))
+	for i, ge := range e.Errors {
+		msgs[i] = ge.String()
+	}
+	return "graphql partial error: " + strings.Join(msgs, "; ")
+}
+
+// isTolerable reports whether a GraphQL error type is a per-node access error
+// safe to skip on a partial board page. Only NOT_FOUND and FORBIDDEN qualify;
+// empty Type, RATE_LIMITED, auth, and syntax errors are all fatal.
+func isTolerable(errType string) bool {
+	return errType == "NOT_FOUND" || errType == "FORBIDDEN"
 }
 
 // Client is a GitHub API client
@@ -611,6 +651,22 @@ func (c *Client) CompareCommits(ctx context.Context, owner, repo, base, head str
 	return result.Commits, nil
 }
 
+// CompareStatus returns GitHub's relationship of head to base for base...head:
+// one of "ahead", "behind", "identical", or "diverged". It is the cheapest way
+// to ask "is base an ancestor of head?" — base...head is "ahead" when head
+// contains base plus more commits, and "identical" when they are the same
+// commit. Used to detect a commit already covered by an existing release tag.
+func (c *Client) CompareStatus(ctx context.Context, owner, repo, base, head string) (string, error) {
+	path := fmt.Sprintf("/repos/%s/%s/compare/%s...%s", owner, repo, base, head)
+	var result struct {
+		Status string `json:"status"`
+	}
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return "", err
+	}
+	return result.Status, nil
+}
+
 // GetJobLogs fetches the logs for a GitHub Actions job (check run).
 // Uses GET /repos/{owner}/{repo}/actions/jobs/{job_id}/logs which returns
 // a 302 redirect to a log download URL. Returns the raw log text.
@@ -763,7 +819,34 @@ func (c *Client) GetPullRequestComments(ctx context.Context, owner, repo string,
 }
 
 // ExecuteGraphQL executes a GitHub GraphQL query or mutation.
+// Posts to baseURL+"/graphql" (testable via NewClientWithBaseURL).
+// result is unmarshalled from response.data if non-nil.
+// Transient transport errors (5xx, network) and GraphQL-level rate limits
+// (HTTP 200 + RATE_LIMITED / "was submitted too quickly") are retried via
+// c.retryOpts, matching the behaviour of doRequest.
+// Any GraphQL error (regardless of type) aborts the call; use
+// ExecuteGraphQLTolerant for board pagination that must survive per-node
+// NOT_FOUND/FORBIDDEN errors.
 func (c *Client) ExecuteGraphQL(ctx context.Context, query string, variables map[string]interface{}, result interface{}) error {
+	return c.executeGraphQLCore(ctx, query, variables, result, false)
+}
+
+// ExecuteGraphQLTolerant is like ExecuteGraphQL but tolerates per-node
+// NOT_FOUND/FORBIDDEN errors in partial responses. When all errors are tolerable
+// it unmarshals Data into result and returns *PartialGraphQLError so the caller
+// can log/count the dropped nodes. A single non-tolerable error (e.g. RATE_LIMITED,
+// empty Type, auth, syntax) causes the whole call to fail exactly as ExecuteGraphQL
+// would, without unmarshalling Data.
+func (c *Client) ExecuteGraphQLTolerant(ctx context.Context, query string, variables map[string]interface{}, result interface{}) error {
+	return c.executeGraphQLCore(ctx, query, variables, result, true)
+}
+
+// executeGraphQLCore is the shared implementation for ExecuteGraphQL and
+// ExecuteGraphQLTolerant. When tolerant=false any error in the response is
+// fatal (strict mode). When tolerant=true, a response whose errors are all
+// NOT_FOUND/FORBIDDEN has its data unmarshalled and a *PartialGraphQLError
+// is returned; a single non-tolerable error makes the whole call fatal.
+func (c *Client) executeGraphQLCore(ctx context.Context, query string, variables map[string]interface{}, result interface{}, tolerant bool) error {
 	reqBody := GraphQLRequest{Query: query, Variables: variables}
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
@@ -771,44 +854,76 @@ func (c *Client) ExecuteGraphQL(ctx context.Context, query string, variables map
 	}
 
 	endpoint := c.baseURL + "/graphql"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return fmt.Errorf("create graphql request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("graphql request failed: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("read graphql response: %w", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("graphql API error (status %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	var gqlResp GraphQLResponse
-	if err := json.Unmarshal(respBody, &gqlResp); err != nil {
-		return fmt.Errorf("parse graphql response: %w", err)
-	}
-
-	if len(gqlResp.Errors) > 0 {
-		return fmt.Errorf("graphql error: %s", gqlResp.Errors[0].Message)
-	}
-
-	if result != nil && len(gqlResp.Data) > 0 {
-		if err := json.Unmarshal(gqlResp.Data, result); err != nil {
-			return fmt.Errorf("unmarshal graphql data: %w", err)
+	return WithRetryVoid(ctx, func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return fmt.Errorf("create graphql request: %w", err)
 		}
-	}
+		req.Header.Set("Authorization", "Bearer "+c.token)
+		req.Header.Set("Content-Type", "application/json")
 
-	return nil
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("graphql request failed: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("read graphql response: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("graphql API error (status %d): %s", resp.StatusCode, string(respBody))
+		}
+
+		var gqlResp GraphQLResponse
+		if err := json.Unmarshal(respBody, &gqlResp); err != nil {
+			return fmt.Errorf("parse graphql response: %w", err)
+		}
+
+		if len(gqlResp.Errors) > 0 {
+			// Aggregate ALL errors (message + type + path), not just Errors[0].
+			// GitHub Projects V2 frequently returns several per-node errors at
+			// once, and surfacing only the first made board flows hard to diagnose.
+			//
+			// In tolerant mode: if all errors are NOT_FOUND/FORBIDDEN, unmarshal
+			// the good data and return *PartialGraphQLError. Any non-tolerable error
+			// (including mixed tolerable+fatal) makes the whole response fatal.
+			if tolerant {
+				allTolerable := true
+				for _, ge := range gqlResp.Errors {
+					if !isTolerable(ge.Type) {
+						allTolerable = false
+						break
+					}
+				}
+				if allTolerable {
+					if result != nil && len(gqlResp.Data) > 0 {
+						if err := json.Unmarshal(gqlResp.Data, result); err != nil {
+							return fmt.Errorf("unmarshal graphql data: %w", err)
+						}
+					}
+					return &PartialGraphQLError{Errors: gqlResp.Errors}
+				}
+			}
+
+			msgs := make([]string, len(gqlResp.Errors))
+			for i, ge := range gqlResp.Errors {
+				msgs[i] = ge.String()
+			}
+			return fmt.Errorf("graphql error: %s", strings.Join(msgs, "; "))
+		}
+
+		if result != nil && len(gqlResp.Data) > 0 {
+			if err := json.Unmarshal(gqlResp.Data, result); err != nil {
+				return fmt.Errorf("unmarshal graphql data: %w", err)
+			}
+		}
+
+		return nil
+	}, c.retryOpts)
 }
 
 // SearchPRsForIssue returns all PRs that reference the given issue number.
@@ -850,6 +965,50 @@ func (c *Client) SearchPRsForIssue(ctx context.Context, owner, repo string, issu
 	return prs, nil
 }
 
+// SearchOpenPRsForIssue returns open PRs that reference the given issue number.
+// The returned PullRequest values include the User (author) field so callers can
+// distinguish Pilot-bot PRs from human recovery PRs.
+func (c *Client) SearchOpenPRsForIssue(ctx context.Context, owner, repo string, issueNumber int) ([]*PullRequest, error) {
+	q := fmt.Sprintf("repo:%s/%s is:pr is:open #%d", owner, repo, issueNumber)
+	path := fmt.Sprintf("/search/issues?q=%s&per_page=100", url.QueryEscape(q))
+
+	var result struct {
+		Items []struct {
+			ID      int64  `json:"id"`
+			Number  int    `json:"number"`
+			Title   string `json:"title"`
+			State   string `json:"state"`
+			HTMLURL string `json:"html_url"`
+			User    *User  `json:"user"`
+		} `json:"items"`
+	}
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return nil, fmt.Errorf("search open PRs for issue #%d: %w", issueNumber, err)
+	}
+
+	prs := make([]*PullRequest, 0, len(result.Items))
+	for _, item := range result.Items {
+		prs = append(prs, &PullRequest{
+			ID:      item.ID,
+			Number:  item.Number,
+			Title:   item.Title,
+			State:   item.State,
+			HTMLURL: item.HTMLURL,
+			User:    item.User,
+		})
+	}
+	return prs, nil
+}
+
+// GetAuthenticatedUser returns the GitHub user associated with the current token.
+func (c *Client) GetAuthenticatedUser(ctx context.Context) (*User, error) {
+	var user User
+	if err := c.doRequest(ctx, http.MethodGet, "/user", nil, &user); err != nil {
+		return nil, fmt.Errorf("get authenticated user: %w", err)
+	}
+	return &user, nil
+}
+
 // SearchMergedPRsForIssue checks if any merged PRs exist that reference the given
 // issue number in their title. Returns true if at least one merged PR is found.
 func (c *Client) SearchMergedPRsForIssue(ctx context.Context, owner, repo string, issueNumber int) (bool, error) {
@@ -878,6 +1037,30 @@ func (c *Client) FindMergedPRByBranch(ctx context.Context, owner, repo, branch s
 	}
 	for _, pr := range prs {
 		if pr.MergedAt != "" || pr.Merged {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// FindOpenPRByBranch looks up OPEN PRs by head branch via the strongly-consistent
+// REST API (no Search API indexing lag). Returns true if any open PR exists on
+// that branch — the counterpart to FindMergedPRByBranch for the
+// PR-created-but-not-yet-merged window.
+func (c *Client) FindOpenPRByBranch(ctx context.Context, owner, repo, branch string) (bool, error) {
+	head := fmt.Sprintf("%s:%s", owner, branch)
+	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s&state=open&per_page=10",
+		owner, repo, url.QueryEscape(head))
+
+	var prs []*PullRequest
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &prs); err != nil {
+		return false, fmt.Errorf("list open PRs by branch %s: %w", branch, err)
+	}
+	// The server filters by head=owner:branch&state=open, so a matching PR has
+	// state=="open" and head.ref==branch. Re-check both rather than trusting the
+	// array length, mirroring FindMergedPRByBranch's field inspection.
+	for _, pr := range prs {
+		if pr.State == "open" && pr.Head.Ref == branch {
 			return true, nil
 		}
 	}
