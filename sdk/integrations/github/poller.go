@@ -82,6 +82,15 @@ type Poller struct {
 	maxRetryReadyRetries int
 
 	pollerMetrics skipreason.PollerMetricsRecorder
+
+	// projectBoardSource sources candidates from a Projects V2 board column instead
+	// of by label. nil means label-based discovery (default, unchanged behavior).
+	projectBoardSource *ProjectBoardSource
+
+	// boardSync moves the issue card to inProgressStatus on confirmed dispatch.
+	// nil or empty inProgressStatus disables the write-back, keeping label-mode identical.
+	boardSync        *ProjectBoardSync
+	inProgressStatus string
 }
 
 // PollerOption configures a Poller.
@@ -165,6 +174,22 @@ func WithMaxConcurrent(n int) PollerOption {
 // WithPollerMetrics sets the recorder for per-repo dispatch/skip counters.
 func WithPollerMetrics(rec skipreason.PollerMetricsRecorder) PollerOption {
 	return func(p *Poller) { p.pollerMetrics = rec }
+}
+
+// WithProjectBoardSource configures the poller to source candidates from a Projects V2
+// board column instead of by label. When set, FindIssuesFromProject replaces ListIssues
+// as the candidate fetch in fetchCandidates; all downstream filters are unchanged.
+func WithProjectBoardSource(src *ProjectBoardSource) PollerOption {
+	return func(p *Poller) { p.projectBoardSource = src }
+}
+
+// WithBoardSync configures the poller to move the issue card to inProgressStatus on the
+// Projects V2 board after confirmed dispatch. No-op when bs is nil or inProgressStatus is "".
+func WithBoardSync(bs *ProjectBoardSync, inProgressStatus string) PollerOption {
+	return func(p *Poller) {
+		p.boardSync = bs
+		p.inProgressStatus = inProgressStatus
+	}
 }
 
 // NewPoller creates a new GitHub issue poller.
@@ -343,6 +368,8 @@ func (p *Poller) startSequential(ctx context.Context) {
 			slog.String("title", issue.Title),
 		)
 
+		p.syncBoardStatusInProgress(ctx, issue)
+
 		result, err := p.processIssueSequential(ctx, issue)
 		if err != nil {
 			p.logger.Error("Failed to process issue",
@@ -438,12 +465,58 @@ func (p *Poller) startSequential(ctx context.Context) {
 	}
 }
 
-func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error) {
-	issues, err := p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
+// fetchCandidates returns the raw candidate issues for this poll cycle. When a
+// projectBoardSource is configured it sources from the board column instead of
+// listing open issues by label. This is the single source-selection point used
+// by BOTH dispatch paths — findOldestUnprocessedIssue (sequential) and
+// checkForNewIssues (parallel/auto) — so the board source is honored regardless
+// of execution mode.
+func (p *Poller) fetchCandidates(ctx context.Context) ([]*Issue, error) {
+	if p.projectBoardSource != nil {
+		sourceStatus := p.projectBoardSource.config.SourceStatus
+		if sourceStatus == "" {
+			sourceStatus = "Todo"
+		}
+		return p.projectBoardSource.FindIssuesFromProject(ctx, sourceStatus)
+	}
+	return p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
 		Labels: []string{p.label},
 		State:  StateOpen,
-		Sort:   "created",
+		Sort:   "created", // oldest first
 	})
+}
+
+// syncBoardStatusInProgress moves the issue card to the configured in-progress status
+// on the Projects V2 board. Called once after confirmed dispatch, before execution starts.
+// Logs errors but does not fail the dispatch — board sync is best-effort.
+// No-op when boardSync is nil or inProgressStatus is empty.
+func (p *Poller) syncBoardStatusInProgress(ctx context.Context, issue *Issue) {
+	if p.boardSync == nil || p.inProgressStatus == "" {
+		return
+	}
+
+	nodeID := issue.NodeID
+	if nodeID == "" {
+		var err error
+		nodeID, err = p.client.GetIssueNodeID(ctx, p.owner, p.repo, issue.Number)
+		if err != nil {
+			p.logger.Warn("board sync: failed to resolve issue node ID",
+				slog.Int("issue", issue.Number),
+				slog.Any("error", err))
+			return
+		}
+	}
+
+	if err := p.boardSync.UpdateProjectItemStatus(ctx, nodeID, p.inProgressStatus); err != nil {
+		p.logger.Warn("board sync: failed to update project item status",
+			slog.Int("issue", issue.Number),
+			slog.String("status", p.inProgressStatus),
+			slog.Any("error", err))
+	}
+}
+
+func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error) {
+	issues, err := p.fetchCandidates(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -673,11 +746,7 @@ func (p *Poller) recordDeferredScopeOverlap() {
 }
 
 func (p *Poller) checkForNewIssues(ctx context.Context) {
-	issues, err := p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
-		Labels: []string{p.label},
-		State:  StateOpen,
-		Sort:   "created",
-	})
+	issues, err := p.fetchCandidates(ctx)
 	if err != nil {
 		p.logger.Warn("Failed to fetch issues", slog.Any("error", err))
 		return
@@ -840,6 +909,8 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 		go func(issue *Issue) {
 			defer p.activeWg.Done()
 			defer func() { <-p.semaphore }()
+
+			p.syncBoardStatusInProgress(ctx, issue)
 
 			if p.onIssueWithResult != nil {
 				sanitizeIssueInPlace(p.logger, issue)

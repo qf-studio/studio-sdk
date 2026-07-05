@@ -38,6 +38,7 @@ type ProjectBoardConfig struct {
 	ProjectNumber int             `yaml:"project_number"` // Project number from URL
 	StatusField   string          `yaml:"status_field"`   // Field name, e.g. "Status"
 	Statuses      ProjectStatuses `yaml:"statuses"`
+	SourceStatus  string          `yaml:"source_status"` // Board column to source issues from (default "Todo")
 }
 
 // ProjectStatuses maps lifecycle events to board column names.
