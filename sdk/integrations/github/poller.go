@@ -91,6 +91,16 @@ type Poller struct {
 	// nil or empty inProgressStatus disables the write-back, keeping label-mode identical.
 	boardSync        *ProjectBoardSync
 	inProgressStatus string
+
+	// Host-supplied execution-pipeline hooks (core.PollerDeps parity). All nil-safe:
+	// a nil hook disables the corresponding gate, preserving pre-hook behavior.
+	taskChecker        core.TaskChecker
+	execChecker        core.ExecutionChecker
+	projectPath        string
+	preFlightJudge     core.PreFlightJudger
+	execSaver          core.ExecutionSaver
+	issueMetrics       core.IssueMetricsRecorder
+	rateLimitScheduler core.RateLimitScheduler
 }
 
 // PollerOption configures a Poller.
@@ -190,6 +200,46 @@ func WithBoardSync(bs *ProjectBoardSync, inProgressStatus string) PollerOption {
 		p.boardSync = bs
 		p.inProgressStatus = inProgressStatus
 	}
+}
+
+// WithTaskChecker sets the checker consulted during retry-grace evaluation so
+// issues whose tasks are still queued/in-progress are not re-dispatched.
+func WithTaskChecker(tc core.TaskChecker) PollerOption {
+	return func(p *Poller) { p.taskChecker = tc }
+}
+
+// WithExecutionChecker sets the completed-execution guard. projectPath scopes
+// its lookups (and ExecutionSaver records) to the local project checkout.
+func WithExecutionChecker(ec core.ExecutionChecker, projectPath string) PollerOption {
+	return func(p *Poller) {
+		p.execChecker = ec
+		p.projectPath = projectPath
+	}
+}
+
+// WithPreFlightJudge sets the judge that evaluates issue quality before
+// dispatch. Rejected issues get the needs-clarification label plus an
+// explanatory comment and are NOT marked processed, so removing the label
+// re-triggers dispatch.
+func WithPreFlightJudge(judge core.PreFlightJudger) PollerOption {
+	return func(p *Poller) { p.preFlightJudge = judge }
+}
+
+// WithExecutionSaver sets the sink for pre-flight rejection records.
+func WithExecutionSaver(saver core.ExecutionSaver) PollerOption {
+	return func(p *Poller) { p.execSaver = saver }
+}
+
+// WithIssueMetricsRecorder sets the recorder for issue processing outcomes.
+func WithIssueMetricsRecorder(rec core.IssueMetricsRecorder) PollerOption {
+	return func(p *Poller) { p.issueMetrics = rec }
+}
+
+// WithRateLimitScheduler sets the host scheduler that classifies rate-limited
+// handler errors and queues timed retries. When it accepts an error the issue
+// is left unmarked — the scheduler owns the retry.
+func WithRateLimitScheduler(s core.RateLimitScheduler) PollerOption {
+	return func(p *Poller) { p.rateLimitScheduler = s }
 }
 
 // NewPoller creates a new GitHub issue poller.
@@ -368,10 +418,17 @@ func (p *Poller) startSequential(ctx context.Context) {
 			slog.String("title", issue.Title),
 		)
 
+		if !p.passesPreFlight(ctx, issue) {
+			continue // skip dispatch WITHOUT marking processed; label removal re-triggers
+		}
+
 		p.syncBoardStatusInProgress(ctx, issue)
 
 		result, err := p.processIssueSequential(ctx, issue)
 		if err != nil {
+			if p.queueRateLimitRetry(issue, err) {
+				continue // not marked processed — the host scheduler owns the retry
+			}
 			p.logger.Error("Failed to process issue",
 				slog.Int("number", issue.Number),
 				slog.Any("error", err),
@@ -568,6 +625,10 @@ func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error)
 				continue
 			}
 
+			if p.isTaskStillQueued(issue) {
+				continue
+			}
+
 			p.logger.Info("Issue was processed but status labels removed, allowing retry",
 				slog.Int("number", issue.Number))
 			p.mu.Lock()
@@ -584,6 +645,10 @@ func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error)
 			if p.hasMergedWork(ctx, issue) {
 				continue
 			}
+		}
+
+		if p.hasCompletedExecution(issue) {
+			continue
 		}
 
 		candidates = append(candidates, issue)
@@ -812,6 +877,11 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 				continue
 			}
 
+			if p.isTaskStillQueued(issue) {
+				p.recordSkip(skipreason.ReasonTaskQueued)
+				continue
+			}
+
 			p.logger.Info("Issue was processed but status labels removed, allowing retry",
 				slog.Int("number", issue.Number))
 			p.mu.Lock()
@@ -836,6 +906,11 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 				slog.Int("number", issue.Number),
 			)
 			p.recordSkip(skipreason.ReasonPendingDependency)
+			continue
+		}
+
+		if p.hasCompletedExecution(issue) {
+			p.recordSkip(skipreason.ReasonCompletedExecution)
 			continue
 		}
 
@@ -883,6 +958,11 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 			)
 		}
 
+		if !p.passesPreFlight(ctx, issue) {
+			p.recordSkip(skipreason.ReasonPreFlightReject)
+			continue // skip markProcessed so label removal re-triggers dispatch
+		}
+
 		p.markProcessed(issue.Number)
 
 		select {
@@ -916,6 +996,9 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 				sanitizeIssueInPlace(p.logger, issue)
 				result, err := p.onIssueWithResult(ctx, issue)
 				if err != nil {
+					if p.queueRateLimitRetry(issue, err) {
+						return // stay marked processed — the host scheduler owns the retry
+					}
 					p.logger.Error("Failed to process issue",
 						slog.Int("number", issue.Number),
 						slog.Any("error", err),
@@ -942,6 +1025,9 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 			} else if p.onIssue != nil {
 				sanitizeIssueInPlace(p.logger, issue)
 				if err := p.onIssue(ctx, issue); err != nil {
+					if p.queueRateLimitRetry(issue, err) {
+						return // stay marked processed — the host scheduler owns the retry
+					}
 					p.logger.Error("Failed to process issue",
 						slog.Int("number", issue.Number),
 						slog.Any("error", err),
@@ -1165,6 +1251,19 @@ func (p *Poller) shouldRetryRetryReadyIssue(ctx context.Context, issue *Issue) b
 	p.retryReadyCount[issue.Number]++
 	p.mu.Unlock()
 
+	// Delete any stale completed execution row so hasCompletedExecution doesn't
+	// silently no-op the re-dispatch. Must happen before ClearProcessed so the
+	// issue can actually reach the dispatch gate.
+	if p.execChecker != nil {
+		taskID := fmt.Sprintf("GH-%d", issue.Number)
+		if err := p.execChecker.InvalidateCompletion(taskID, p.projectPath); err != nil {
+			p.logger.Warn("InvalidateCompletion failed on retry-ready re-dispatch — proceeding",
+				slog.String("task_id", taskID),
+				slog.Any("error", err),
+			)
+		}
+	}
+
 	p.ClearProcessed(issue.Number)
 
 	p.logger.Info("Auto-retrying pilot-retry-ready issue",
@@ -1257,6 +1356,136 @@ func (p *Poller) hasPendingDependencies(ctx context.Context, issue *Issue) bool 
 	}
 
 	return false
+}
+
+// isTaskStillQueued reports whether the issue's task is still queued or
+// in-progress in the host pipeline. Consulted after the retry grace period so
+// a long-running execution is never re-dispatched. nil checker means "not queued".
+func (p *Poller) isTaskStillQueued(issue *Issue) bool {
+	if p.taskChecker == nil {
+		return false
+	}
+	taskID := fmt.Sprintf("GH-%d", issue.Number)
+	if !p.taskChecker.IsTaskQueued(taskID) {
+		return false
+	}
+	p.logger.Debug("Issue still queued/in-progress, skipping retry",
+		slog.Int("number", issue.Number),
+		slog.String("task_id", taskID))
+	return true
+}
+
+// hasCompletedExecution reports whether a completed execution record already
+// exists for the issue — prevents re-dispatch when the done label failed to
+// apply. On a positive hit the issue is marked processed. Check errors fail
+// open (dispatch rather than lose work).
+func (p *Poller) hasCompletedExecution(issue *Issue) bool {
+	if p.execChecker == nil {
+		return false
+	}
+	taskID := fmt.Sprintf("GH-%d", issue.Number)
+	completed, err := p.execChecker.HasCompletedExecution(taskID, p.projectPath)
+	if err != nil {
+		p.logger.Warn("Failed to check execution status",
+			slog.Int("number", issue.Number),
+			slog.Any("error", err))
+		return false
+	}
+	if !completed {
+		return false
+	}
+	p.logger.Info("Skipping re-dispatch — completed execution exists",
+		slog.Int("number", issue.Number),
+		slog.String("task_id", taskID))
+	p.markProcessed(issue.Number)
+	return true
+}
+
+// passesPreFlight runs the pre-flight judge when configured. A judge error
+// fails open (dispatch proceeds). On rejection the issue is labeled and
+// commented via handlePreFlightReject and the caller must skip dispatch
+// WITHOUT marking the issue processed, so removing the needs-clarification
+// label re-triggers it on a later poll.
+func (p *Poller) passesPreFlight(ctx context.Context, issue *Issue) bool {
+	if p.preFlightJudge == nil {
+		return true
+	}
+	verdict, err := p.preFlightJudge.JudgeIssue(ctx, issue.Title, issue.Body, "")
+	if err != nil {
+		p.logger.Warn("pre-flight judge error (fail-open)",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", err))
+		return true
+	}
+	if verdict.Accepted {
+		return true
+	}
+	p.logger.Info("pre-flight rejected issue",
+		slog.Int("issue", issue.Number),
+		slog.String("decision", verdict.Decision),
+		slog.String("reason", verdict.Reason))
+	p.handlePreFlightReject(ctx, issue, verdict)
+	return false
+}
+
+// handlePreFlightReject handles an issue rejected by the pre-flight judge:
+//   - adds the needs-clarification label so the issue is filtered on later polls
+//   - posts a comment explaining the decision and how to re-trigger
+//   - saves a declined-preflight execution record if an ExecutionSaver is wired
+//
+// The caller must NOT mark the issue processed, so label removal re-triggers dispatch.
+func (p *Poller) handlePreFlightReject(ctx context.Context, issue *Issue, verdict core.Verdict) {
+	taskID := fmt.Sprintf("GH-%d", issue.Number)
+
+	if err := p.client.AddLabels(ctx, p.owner, p.repo, issue.Number, []string{LabelNeedsClarification}); err != nil {
+		p.logger.Warn("pre-flight: failed to add needs-clarification label",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", err))
+	}
+
+	comment := fmt.Sprintf(
+		"**Pre-flight check declined this issue.**\n\n"+
+			"**Decision:** `%s`\n"+
+			"**Reason:** %s\n"+
+			"**Confidence:** %.0f%%\n\n"+
+			"To re-trigger: edit the issue to address the above, then remove the `%s` label.",
+		verdict.Decision, verdict.Reason, verdict.Confidence*100, LabelNeedsClarification,
+	)
+	if _, err := p.client.AddComment(ctx, p.owner, p.repo, issue.Number, comment); err != nil {
+		p.logger.Warn("pre-flight: failed to post rejection comment",
+			slog.Int("issue", issue.Number),
+			slog.Any("error", err))
+	}
+
+	if p.execSaver != nil {
+		if err := p.execSaver.SaveDeclinedExecution(taskID, p.projectPath, "declined-preflight", verdict.Reason); err != nil {
+			p.logger.Warn("pre-flight: failed to save execution record",
+				slog.Int("issue", issue.Number),
+				slog.Any("error", err))
+		}
+	}
+}
+
+// queueRateLimitRetry hands a rate-limited handler error to the host
+// scheduler. Returns true when the host recognized the error and queued a
+// timed retry — the issue then stays out of the poller's failure path so the
+// scheduler owns the retry. The issue's Title/Body are already sanitized by
+// the dispatch path before the handler runs.
+func (p *Poller) queueRateLimitRetry(issue *Issue, err error) bool {
+	if p.rateLimitScheduler == nil || err == nil {
+		return false
+	}
+	taskID := fmt.Sprintf("GH-%d", issue.Number)
+	if !p.rateLimitScheduler.QueueRetryIfRateLimited(taskID, issue.Title, issue.Body, err.Error()) {
+		return false
+	}
+	p.logger.Info("Task queued for retry after rate limit",
+		slog.Int("issue", issue.Number),
+		slog.String("task_id", taskID))
+	if p.issueMetrics != nil {
+		p.issueMetrics.RecordIssueProcessed("rate_limited")
+	}
+	return true
 }
 
 // Drain stops accepting new issues and waits for active executions to finish.

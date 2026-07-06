@@ -55,6 +55,15 @@ type ChatDeps struct {
 	Handler MessageHandler
 }
 
+type ExecutionChecker interface {
+	HasCompletedExecution(taskID, projectPath string) (bool, error)
+	InvalidateCompletion(taskID, projectPath string) error
+}
+
+type ExecutionSaver interface {
+	SaveDeclinedExecution(taskID, projectPath, status, reason string) error
+}
+
 type Identity struct {
 	UserID string
 	DisplayName string
@@ -77,6 +86,10 @@ type IssueHandler interface {
 }
 
 type IssueHandlerFunc func(ctx context.Context, ev IssueEvent) (*IssueResult, error)
+
+type IssueMetricsRecorder interface {
+	RecordIssueProcessed(result string)
+}
 
 type IssueResult struct {
 	Success bool
@@ -143,6 +156,17 @@ type PollerDeps struct {
 	MaxConcurrent int
 	Handler IssueHandler
 	OnPRCreated func(ev PRCreatedEvent)
+	TaskChecker TaskChecker
+	ExecutionChecker ExecutionChecker
+	ProjectPath string
+	PreFlightJudge PreFlightJudger
+	ExecutionSaver ExecutionSaver
+	IssueMetricsRecorder IssueMetricsRecorder
+	RateLimitScheduler RateLimitScheduler
+}
+
+type PreFlightJudger interface {
+	JudgeIssue(ctx context.Context, title, body, repoContext string) (Verdict, error)
 }
 
 type ProcessedStore interface {
@@ -150,6 +174,21 @@ type ProcessedStore interface {
 	Unmark(source, repo, issueID string) error
 	IsProcessed(source, repo, issueID string) (bool, error)
 	Load(source, repo string) (map[string]time.Time, error)
+}
+
+type RateLimitScheduler interface {
+	QueueRetryIfRateLimited(taskID, title, body, errText string) bool
+}
+
+type TaskChecker interface {
+	IsTaskQueued(taskID string) bool
+}
+
+type Verdict struct {
+	Accepted bool
+	Decision string
+	Reason string
+	Confidence float64
 }
 
 type WebhookCapable interface {
