@@ -119,8 +119,64 @@ type ActiveExecutionLister interface {
 	ListActiveTaskIDs(ctx context.Context) ([]string, error)
 }
 
+// TaskChecker reports whether a task is currently queued or in-progress in
+// the consuming application's execution pipeline. Pollers consult it during
+// retry-grace evaluation so an issue whose task is still running is not
+// re-dispatched.
+type TaskChecker interface {
+	IsTaskQueued(taskID string) bool
+}
+
+// ExecutionChecker verifies whether a completed execution record exists for a
+// task, preventing re-dispatch when a tracker-side "done" marker failed to
+// apply. InvalidateCompletion deletes a stale completed record so an explicit
+// retry is not silently no-op'd.
+type ExecutionChecker interface {
+	HasCompletedExecution(taskID, projectPath string) (bool, error)
+	InvalidateCompletion(taskID, projectPath string) error
+}
+
+// Verdict is the result of a pre-flight judgment on an issue.
+type Verdict struct {
+	Accepted   bool
+	Decision   string
+	Reason     string
+	Confidence float64
+}
+
+// PreFlightJudger evaluates issues before dispatch so pollers do not burn
+// worker slots on vague, ambiguous, or otherwise unactionable issues.
+type PreFlightJudger interface {
+	JudgeIssue(ctx context.Context, title, body, repoContext string) (Verdict, error)
+}
+
+// ExecutionSaver persists pre-flight rejection records for observability.
+type ExecutionSaver interface {
+	SaveDeclinedExecution(taskID, projectPath, status, reason string) error
+}
+
+// IssueMetricsRecorder records issue processing outcomes (e.g. "rate_limited").
+type IssueMetricsRecorder interface {
+	RecordIssueProcessed(result string)
+}
+
+// RateLimitScheduler lets the consuming application classify a handler error
+// as a rate limit and queue the issue for a timed retry on its own scheduler.
+// QueueRetryIfRateLimited returns true when the error was recognized as a
+// rate limit and a retry was queued — the poller then leaves the issue
+// unmarked so the scheduler owns the retry. Returning false hands the error
+// back to the poller's standard failure path.
+//
+// This is a deliberate seam rather than a concrete scheduler dependency:
+// error classification and task construction stay host-side, so the SDK never
+// imports the application's task or rate-limit types.
+type RateLimitScheduler interface {
+	QueueRetryIfRateLimited(taskID, title, body, errText string) bool
+}
+
 // PollerDeps provides shared infrastructure to adapter pollers. Consuming
-// applications supply these — the SDK never constructs them itself.
+// applications supply these — the SDK never constructs them itself. All
+// fields except Handler are optional; nil disables the corresponding hook.
 type PollerDeps struct {
 	// ProcessedStore deduplicates issues across restarts.
 	ProcessedStore ProcessedStore
@@ -131,6 +187,23 @@ type PollerDeps struct {
 	Handler IssueHandler
 	// OnPRCreated fires after an adapter opens a PR/MR for an issue.
 	OnPRCreated func(ev PRCreatedEvent)
+	// TaskChecker skips retry re-dispatch while a task is still queued/running.
+	TaskChecker TaskChecker
+	// ExecutionChecker prevents re-dispatch when a completed execution record
+	// exists. Its lookups (and ExecutionSaver records) are scoped by ProjectPath.
+	ExecutionChecker ExecutionChecker
+	// ProjectPath identifies the local project checkout used to scope
+	// ExecutionChecker/ExecutionSaver records.
+	ProjectPath string
+	// PreFlightJudge evaluates issue quality before dispatch; rejections are
+	// surfaced on the tracker and the issue is not dispatched.
+	PreFlightJudge PreFlightJudger
+	// ExecutionSaver persists pre-flight rejection records.
+	ExecutionSaver ExecutionSaver
+	// IssueMetricsRecorder records issue processing outcomes.
+	IssueMetricsRecorder IssueMetricsRecorder
+	// RateLimitScheduler queues timed retries for rate-limited handler errors.
+	RateLimitScheduler RateLimitScheduler
 }
 
 // --- Registry ---

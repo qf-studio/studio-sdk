@@ -109,6 +109,39 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 			})
 		}))
 	}
+	if deps.TaskChecker != nil {
+		opts = append(opts, WithTaskChecker(deps.TaskChecker))
+	}
+	if deps.ExecutionChecker != nil {
+		opts = append(opts, WithExecutionChecker(deps.ExecutionChecker, deps.ProjectPath))
+	}
+	if deps.PreFlightJudge != nil {
+		opts = append(opts, WithPreFlightJudge(deps.PreFlightJudge))
+	}
+	if deps.ExecutionSaver != nil {
+		opts = append(opts, WithExecutionSaver(deps.ExecutionSaver))
+	}
+	if deps.IssueMetricsRecorder != nil {
+		opts = append(opts, WithIssueMetricsRecorder(deps.IssueMetricsRecorder))
+	}
+	if deps.RateLimitScheduler != nil {
+		opts = append(opts, WithRateLimitScheduler(deps.RateLimitScheduler))
+	}
+
+	// Board layer is config-driven, not a PollerDeps hook: construct the board
+	// source/sync from ProjectBoardConfig so hosts get board mode by config alone.
+	if pb := a.config.ProjectBoard; pb != nil && pb.Enabled {
+		parts := strings.SplitN(repo, "/", 2)
+		if len(parts) == 2 {
+			ownerName, repoName := parts[0], parts[1]
+			if bs := NewProjectBoardSync(client, pb, ownerName); bs != nil && pb.GetStatuses().InProgress != "" {
+				opts = append(opts, WithBoardSync(bs, pb.GetStatuses().InProgress))
+			}
+			if pb.SourceEnabled {
+				opts = append(opts, WithProjectBoardSource(NewProjectBoardSource(client, pb, ownerName, repoName)))
+			}
+		}
+	}
 
 	// NewPoller can only fail on invalid repo format; DefaultConfig guarantees "unknown/unknown"
 	// as a fallback so this is always valid after the check above.
