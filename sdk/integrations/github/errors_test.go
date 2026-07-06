@@ -2,7 +2,9 @@ package github
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -183,5 +185,40 @@ func TestGetOpenSubIssueNumbers_NoNativeLinks(t *testing.T) {
 	}
 	if hasLinks || numbers != nil {
 		t.Errorf("got (%v, %v), want (nil, false)", numbers, hasLinks)
+	}
+}
+
+func TestGetTagForSHA_Exhaustive(t *testing.T) {
+	// Target SHA appears on page 2 — a bounded single-page lookup misses it.
+	page1 := make([]map[string]interface{}, 100)
+	for i := range page1 {
+		page1[i] = map[string]interface{}{"name": fmt.Sprintf("v1.0.%d", i), "commit": map[string]string{"sha": fmt.Sprintf("p1sha%03d", i)}}
+	}
+	page2 := []map[string]interface{}{
+		{"name": "v0.9.7-target", "commit": map[string]string{"sha": "deepsha"}},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Query().Get("page") == "2" {
+			_ = json.NewEncoder(w).Encode(page2)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(page1)
+	}))
+	defer srv.Close()
+
+	c := NewClientWithBaseURL(testutil.FakeGitHubToken, srv.URL)
+	name, err := c.GetTagForSHA(context.Background(), "o", "r", "deepsha")
+	if err != nil {
+		t.Fatalf("GetTagForSHA: %v", err)
+	}
+	if name != "v0.9.7-target" {
+		t.Errorf("tag = %q, want v0.9.7-target (page-2 tag must be found)", name)
+	}
+
+	// Absent SHA terminates on the short page without error.
+	name, err = c.GetTagForSHA(context.Background(), "o", "r", "nosuch")
+	if err != nil || name != "" {
+		t.Errorf("absent SHA: got (%q, %v), want (\"\", nil)", name, err)
 	}
 }
