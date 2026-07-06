@@ -203,7 +203,31 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+			msg := string(respBody)
+			if resp.StatusCode == http.StatusUnauthorized {
+				return &AuthError{Message: msg}
+			}
+			if resp.StatusCode == http.StatusTooManyRequests {
+				return &RateLimitError{
+					StatusCode: http.StatusTooManyRequests,
+					RetryAfter: parseRetryAfterHeader(resp.Header),
+					Message:    msg,
+				}
+			}
+			if resp.StatusCode == http.StatusForbidden {
+				msgLower := strings.ToLower(msg)
+				isRateLimit := resp.Header.Get("X-RateLimit-Remaining") == "0" ||
+					strings.Contains(msgLower, "secondary rate limit") ||
+					strings.Contains(msgLower, "rate limit exceeded")
+				if isRateLimit {
+					return &RateLimitError{
+						StatusCode: http.StatusForbidden,
+						RetryAfter: parseRetryAfterHeader(resp.Header),
+						Message:    msg,
+					}
+				}
+			}
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, msg)
 		}
 
 		if result != nil && len(respBody) > 0 {
@@ -1126,6 +1150,58 @@ func (c *Client) LinkSubIssue(ctx context.Context, owner, repo string, parentNum
 		"childID":  childID,
 	}
 	return c.ExecuteGraphQL(ctx, mutation, variables, nil)
+}
+
+// GetOpenSubIssueNumbers queries native GitHub sub-issues for a parent issue
+// and returns the numbers of sub-issues in OPEN state plus whether the parent
+// has any native sub-issue links at all. Callers that need to cross-check each
+// open child individually (rather than just count them) use this variant.
+func (c *Client) GetOpenSubIssueNumbers(ctx context.Context, owner, repo string, parentNum int) (numbers []int, hasNativeLinks bool, err error) {
+	parentID, err := c.GetIssueNodeID(ctx, owner, repo, parentNum)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve parent node ID: %w", err)
+	}
+
+	const query = `query($issueID: ID!) {
+		node(id: $issueID) {
+			... on Issue {
+				subIssues(first: 100) {
+					totalCount
+					nodes {
+						number
+						state
+					}
+				}
+			}
+		}
+	}`
+
+	var result struct {
+		Node struct {
+			SubIssues struct {
+				TotalCount int `json:"totalCount"`
+				Nodes      []struct {
+					Number int    `json:"number"`
+					State  string `json:"state"`
+				} `json:"nodes"`
+			} `json:"subIssues"`
+		} `json:"node"`
+	}
+
+	if err := c.ExecuteGraphQL(ctx, query, map[string]interface{}{"issueID": parentID}, &result); err != nil {
+		return nil, false, fmt.Errorf("query sub-issues for %s/%s#%d: %w", owner, repo, parentNum, err)
+	}
+
+	if result.Node.SubIssues.TotalCount == 0 {
+		return nil, false, nil
+	}
+
+	for _, n := range result.Node.SubIssues.Nodes {
+		if n.State == "OPEN" {
+			numbers = append(numbers, n.Number)
+		}
+	}
+	return numbers, true, nil
 }
 
 // GetOpenSubIssueCount queries native GitHub sub-issues for a parent issue and returns:

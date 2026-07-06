@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"regexp"
 	"strconv"
 	"strings"
@@ -97,6 +98,18 @@ func isRetryableError(err error) bool {
 		return false
 	}
 
+	// Typed fast path: doRequest classifies 429s and 403-rate-limits as
+	// *RateLimitError (including 403s whose Error() string would not match
+	// the status-code list below).
+	var rlErr *RateLimitError
+	if errors.As(err, &rlErr) {
+		return true
+	}
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		return false // dead token — retrying cannot help
+	}
+
 	errStr := err.Error()
 
 	// Check for retryable HTTP status codes
@@ -147,6 +160,13 @@ func isRetryableError(err error) bool {
 func extractRetryAfter(err error) time.Duration {
 	if err == nil {
 		return 0
+	}
+
+	// Typed fast path: doRequest parses Retry-After/X-RateLimit-Reset headers
+	// into RateLimitError.RetryAfter — no string parsing needed.
+	var rlErr *RateLimitError
+	if errors.As(err, &rlErr) && rlErr.RetryAfter > 0 {
+		return rlErr.RetryAfter
 	}
 
 	errStr := err.Error()

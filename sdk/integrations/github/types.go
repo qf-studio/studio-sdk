@@ -93,6 +93,7 @@ const (
 
 // Label names used by the host
 const (
+	LabelPilot              = "pilot"
 	LabelInProgress         = "pilot-in-progress"
 	LabelDone               = "pilot-done"
 	LabelFailed             = "pilot-failed"
@@ -107,10 +108,18 @@ const (
 	LabelRetry1         = "pilot-retry-1"
 	LabelRetry2         = "pilot-retry-2"
 	LabelRetryExhausted = "pilot-retry-exhausted"
+
+	LabelFailedRetry1         = "pilot-failed-retry-1"
+	LabelFailedRetry2         = "pilot-failed-retry-2"
+	LabelFailedRetryExhausted = "pilot-failed-retry-exhausted"
 )
 
 // RetryStateLabels lists the retry-counter labels in escalation order.
 var RetryStateLabels = []string{LabelRetry1, LabelRetry2, LabelRetryExhausted}
+
+// FailedRetryStateLabels lists the pilot-failed retry-counter labels in
+// escalation order.
+var FailedRetryStateLabels = []string{LabelFailedRetry1, LabelFailedRetry2, LabelFailedRetryExhausted}
 
 // Priority mapping from GitHub labels
 type Priority int
