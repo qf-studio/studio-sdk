@@ -1603,6 +1603,13 @@ func ParseDependencies(body string) []int {
 // parentRefRegex extracts parent issue references from issue body.
 var parentRefRegex = regexp.MustCompile(`(?m)^Parent:\s*(?:GH-|#)(\d+)`)
 
+// ParseParentIssueNumber extracts the parent issue number ("Parent: #N" /
+// "Parent: GH-N") from an issue body. Returns 0 if no parent reference is
+// found. Exported for hosts that apply parent-based gating outside the poller.
+func ParseParentIssueNumber(body string) int {
+	return parseParentIssueNumber(body)
+}
+
 // parseParentIssueNumber extracts the parent issue number from an issue body.
 // Returns 0 if no parent reference is found.
 func parseParentIssueNumber(body string) int {
