@@ -127,6 +127,9 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	if deps.RateLimitScheduler != nil {
 		opts = append(opts, WithRateLimitScheduler(deps.RateLimitScheduler))
 	}
+	if deps.Logger != nil {
+		opts = append(opts, WithPollerLogger(deps.Logger))
+	}
 
 	// Board layer is config-driven, not a PollerDeps hook: construct the board
 	// source/sync from ProjectBoardConfig so hosts get board mode by config alone.

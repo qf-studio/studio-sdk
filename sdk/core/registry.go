@@ -10,6 +10,7 @@ package core
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -204,6 +205,9 @@ type PollerDeps struct {
 	IssueMetricsRecorder IssueMetricsRecorder
 	// RateLimitScheduler queues timed retries for rate-limited handler errors.
 	RateLimitScheduler RateLimitScheduler
+	// Logger receives all poller-originated log lines. Nil falls back to
+	// slog.Default(), so existing consumers see no behavior change.
+	Logger *slog.Logger
 }
 
 // --- Registry ---

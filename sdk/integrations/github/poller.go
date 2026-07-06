@@ -278,6 +278,7 @@ func NewPoller(client *Client, repo string, label string, interval time.Duration
 			PollInterval: p.prPollInterval,
 			Timeout:      p.prTimeout,
 		})
+		p.mergeWaiter.logger = p.logger
 	}
 
 	if p.processedStore != nil {
