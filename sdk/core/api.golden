@@ -163,6 +163,7 @@ type PollerDeps struct {
 	ExecutionSaver ExecutionSaver
 	IssueMetricsRecorder IssueMetricsRecorder
 	RateLimitScheduler RateLimitScheduler
+	Logger *slog.Logger
 }
 
 type PreFlightJudger interface {
