@@ -1528,6 +1528,13 @@ func (p *Poller) Reset() {
 	p.mu.Unlock()
 }
 
+// MarkProcessed marks an issue as processed (in-memory + persistent store),
+// so the poll cycle will not dispatch it. Used by hosts that create and
+// execute sub-issues themselves and must prevent independent re-dispatch.
+func (p *Poller) MarkProcessed(number int) {
+	p.markProcessed(number)
+}
+
 // ClearProcessed removes a single issue from the processed map (for retry).
 func (p *Poller) ClearProcessed(number int) {
 	p.mu.Lock()
