@@ -996,6 +996,184 @@ func TestGetTeamDoneStateID(t *testing.T) {
 	}
 }
 
+func TestListIssues_FollowsCursorPastFirstPage(t *testing.T) {
+	pageOf := func(ids []string, hasNext bool, endCursor string) string {
+		nodes := ""
+		for _, id := range ids {
+			nodes += fmt.Sprintf(`{
+				"id": "%s", "identifier": "%s", "title": "t", "description": "",
+				"priority": 0,
+				"state": {"id": "s", "name": "Todo", "type": "unstarted"},
+				"labels": {"nodes": []},
+				"assignee": null, "project": null,
+				"team": {"id": "team-1", "name": "Eng", "key": "ENG"},
+				"createdAt": "2024-01-01T00:00:00Z", "updatedAt": "2024-01-01T00:00:00Z"
+			},`, id, id)
+		}
+		nodes = nodes[:len(nodes)-1] // trim trailing comma
+		return fmt.Sprintf(`{"issues": {"nodes": [%s], "pageInfo": {"hasNextPage": %v, "endCursor": "%s"}}}`, nodes, hasNext, endCursor)
+	}
+
+	var calls int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		calls++
+
+		after, _ := reqBody.Variables["after"].(string)
+		var body string
+		switch after {
+		case "":
+			body = pageOf([]string{"i1", "i2"}, true, "cursor-1")
+		case "cursor-1":
+			body = pageOf([]string{"i3", "i4"}, true, "cursor-2")
+		case "cursor-2":
+			body = pageOf([]string{"i5"}, false, "")
+		default:
+			t.Fatalf("unexpected after cursor: %q", after)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	issues, err := client.ListIssues(context.Background(), &ListIssuesOptions{TeamID: "ENG", Label: "bug"})
+	if err != nil {
+		t.Fatalf("ListIssues failed: %v", err)
+	}
+
+	if calls != 3 {
+		t.Errorf("expected 3 paginated requests, got %d", calls)
+	}
+	if len(issues) != 5 {
+		t.Fatalf("expected 5 issues across 3 pages, got %d", len(issues))
+	}
+	want := []string{"i1", "i2", "i3", "i4", "i5"}
+	for i, id := range want {
+		if issues[i].ID != id {
+			t.Errorf("issues[%d].ID = %s, want %s", i, issues[i].ID, id)
+		}
+	}
+}
+
+func TestListIssues_SinglePage_NoBehaviorChange(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		if after, ok := reqBody.Variables["after"]; ok && after != "" {
+			t.Fatalf("unexpected after cursor on first request: %v", after)
+		}
+
+		resp := GraphQLResponse{Data: json.RawMessage(`{
+			"issues": {
+				"nodes": [
+					{
+						"id": "issue-1", "identifier": "ENG-1", "title": "t", "description": "",
+						"priority": 0,
+						"state": {"id": "s", "name": "Todo", "type": "unstarted"},
+						"labels": {"nodes": []},
+						"assignee": null, "project": null,
+						"team": {"id": "team-1", "name": "Eng", "key": "ENG"},
+						"createdAt": "2024-01-01T00:00:00Z", "updatedAt": "2024-01-01T00:00:00Z"
+					}
+				],
+				"pageInfo": {"hasNextPage": false, "endCursor": ""}
+			}
+		}`)}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	issues, err := client.ListIssues(context.Background(), &ListIssuesOptions{TeamID: "ENG", Label: "bug"})
+	if err != nil {
+		t.Fatalf("ListIssues failed: %v", err)
+	}
+	if len(issues) != 1 {
+		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+	if issues[0].ID != "issue-1" {
+		t.Errorf("issues[0].ID = %s, want issue-1", issues[0].ID)
+	}
+}
+
+func TestListIssuesSince_FiltersAndFollowsCursor(t *testing.T) {
+	since := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	var calls int
+	var sawSinceFilter bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request body: %v", err)
+		}
+		calls++
+
+		if sinceVar, _ := reqBody.Variables["since"].(string); sinceVar == since.Format(time.RFC3339) {
+			sawSinceFilter = true
+		}
+		if !contains(reqBody.Query, "updatedAt: { gt: $since }") {
+			t.Errorf("query should filter on updatedAt gt $since, got: %s", reqBody.Query)
+		}
+		if !contains(reqBody.Query, "orderBy: updatedAt") {
+			t.Errorf("query should order by updatedAt, got: %s", reqBody.Query)
+		}
+
+		after, _ := reqBody.Variables["after"].(string)
+		var body string
+		if after == "" {
+			body = `{"issues": {"nodes": [
+				{"id": "i1", "identifier": "ENG-1", "title": "t", "description": "",
+				 "priority": 0, "state": {"id": "s", "name": "Todo", "type": "unstarted"},
+				 "labels": {"nodes": []}, "assignee": null, "project": null,
+				 "team": {"id": "team-1", "name": "Eng", "key": "ENG"},
+				 "createdAt": "2024-06-02T00:00:00Z", "updatedAt": "2024-06-02T00:00:00Z"}
+			], "pageInfo": {"hasNextPage": true, "endCursor": "cursor-1"}}}`
+		} else {
+			body = `{"issues": {"nodes": [
+				{"id": "i2", "identifier": "ENG-2", "title": "t", "description": "",
+				 "priority": 0, "state": {"id": "s", "name": "Todo", "type": "unstarted"},
+				 "labels": {"nodes": []}, "assignee": null, "project": null,
+				 "team": {"id": "team-1", "name": "Eng", "key": "ENG"},
+				 "createdAt": "2024-06-03T00:00:00Z", "updatedAt": "2024-06-03T00:00:00Z"}
+			], "pageInfo": {"hasNextPage": false, "endCursor": ""}}}`
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	issues, err := client.ListIssuesSince(context.Background(), &ListIssuesSinceOptions{TeamID: "ENG", Since: since})
+	if err != nil {
+		t.Fatalf("ListIssuesSince failed: %v", err)
+	}
+
+	if calls != 2 {
+		t.Errorf("expected 2 paginated requests, got %d", calls)
+	}
+	if !sawSinceFilter {
+		t.Error("expected since variable to be sent as RFC3339 formatted string")
+	}
+	if len(issues) != 2 {
+		t.Fatalf("expected 2 issues across 2 pages, got %d", len(issues))
+	}
+	if issues[0].ID != "i1" || issues[1].ID != "i2" {
+		t.Errorf("issues = %v, want [i1, i2] in order", issues)
+	}
+}
+
 func TestGetTeamDoneStateID_Cache(t *testing.T) {
 	callCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
