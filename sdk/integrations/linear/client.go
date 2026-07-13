@@ -61,6 +61,7 @@ type Issue struct {
 	Assignee    *User     `json:"assignee"`
 	Project     *Project  `json:"project"`
 	Team        Team      `json:"team"`
+	URL         string    `json:"url"`
 	CreatedAt   time.Time `json:"createdAt"`
 	UpdatedAt   time.Time `json:"updatedAt"`
 }
@@ -203,6 +204,7 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 					name
 					key
 				}
+				url
 				createdAt
 				updatedAt
 			}
@@ -296,6 +298,7 @@ func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Is
 					assignee { id name email }
 					project { id name }
 					team { id name key }
+					url
 					createdAt
 					updatedAt
 				}
@@ -385,6 +388,7 @@ func (c *Client) ListIssuesSince(ctx context.Context, opts *ListIssuesSinceOptio
 					assignee { id name email }
 					project { id name }
 					team { id name key }
+					url
 					createdAt
 					updatedAt
 				}
@@ -443,6 +447,7 @@ type issueListItem struct {
 	Assignee  *User     `json:"assignee"`
 	Project   *Project  `json:"project"`
 	Team      Team      `json:"team"`
+	URL       string    `json:"url"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -459,6 +464,7 @@ func (r *issueListItem) toIssue() *Issue {
 		Assignee:    r.Assignee,
 		Project:     r.Project,
 		Team:        r.Team,
+		URL:         r.URL,
 		CreatedAt:   r.CreatedAt,
 		UpdatedAt:   r.UpdatedAt,
 	}
