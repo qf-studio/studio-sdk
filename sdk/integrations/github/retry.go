@@ -7,71 +7,33 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	retryutil "github.com/qf-studio/studio-sdk/sdk/util/retry"
 )
 
-// RetryOptions configures retry behavior
-type RetryOptions struct {
-	MaxRetries int           // Maximum number of retries (default: 3)
-	BaseDelay  time.Duration // Initial delay between retries (default: 1s)
-	MaxDelay   time.Duration // Maximum delay between retries (default: 30s)
-}
+// RetryOptions configures retry behavior. The backoff/context-cancellation
+// engine lives in sdk/util/retry; this alias keeps the existing github API
+// surface (Client.retryOpts, tests) unchanged.
+type RetryOptions = retryutil.RetryOptions
 
-// DefaultRetryOptions returns sensible defaults for retry behavior
+// DefaultRetryOptions returns sensible defaults for retry behavior.
 func DefaultRetryOptions() RetryOptions {
-	return RetryOptions{
-		MaxRetries: 3,
-		BaseDelay:  1 * time.Second,
-		MaxDelay:   30 * time.Second,
-	}
+	return retryutil.DefaultRetryOptions()
 }
 
 // WithRetry executes an operation with exponential backoff retry.
-// It respects context cancellation and GitHub's Retry-After header.
+// It respects context cancellation and GitHub's Retry-After header. Error
+// classification defaults to GitHub's own isRetryableError/extractRetryAfter
+// (provider-specific: 429/403-rate-limit, 5xx, network errors, GraphQL
+// RATE_LIMITED) unless the caller already set Classify/ExtractRetryAfter.
 func WithRetry[T any](ctx context.Context, op func() (T, error), opts RetryOptions) (T, error) {
-	var result T
-	var lastErr error
-
-	for attempt := 0; attempt <= opts.MaxRetries; attempt++ {
-		result, lastErr = op()
-		if lastErr == nil {
-			return result, nil
-		}
-
-		// Don't retry non-retryable errors
-		if !isRetryableError(lastErr) {
-			return result, lastErr
-		}
-
-		// Don't retry if we've exhausted retries
-		if attempt >= opts.MaxRetries {
-			return result, lastErr
-		}
-
-		// Calculate delay with exponential backoff: 1s, 2s, 4s, 8s...
-		delay := opts.BaseDelay * time.Duration(1<<uint(attempt))
-		if delay > opts.MaxDelay {
-			delay = opts.MaxDelay
-		}
-
-		// Check for Retry-After header in rate limit errors; cap at MaxDelay so
-		// a runaway "Retry-After: 3600" can't stall the worker for an hour.
-		if retryAfter := extractRetryAfter(lastErr); retryAfter > 0 {
-			if retryAfter > opts.MaxDelay {
-				retryAfter = opts.MaxDelay
-			}
-			delay = retryAfter
-		}
-
-		// Wait with context cancellation support
-		select {
-		case <-ctx.Done():
-			return result, ctx.Err()
-		case <-time.After(delay):
-			// Continue to next retry attempt
-		}
+	if opts.Classify == nil {
+		opts.Classify = isRetryableError
 	}
-
-	return result, lastErr
+	if opts.ExtractRetryAfter == nil {
+		opts.ExtractRetryAfter = extractRetryAfter
+	}
+	return retryutil.WithRetry(ctx, op, opts)
 }
 
 // WithRetryVoid is like WithRetry but for operations that don't return a value.
