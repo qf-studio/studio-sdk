@@ -260,17 +260,29 @@ type ListIssuesOptions struct {
 	States     []string
 }
 
-// ListIssues fetches issues matching the filter criteria.
+// listIssuesPageSize is the GraphQL page size used when cursor-following
+// issue list queries. Linear's API max is 250; we stay well under it.
+const listIssuesPageSize = 100
+
+// pageInfo is the GraphQL Relay-style pagination cursor.
+type pageInfo struct {
+	HasNextPage bool   `json:"hasNextPage"`
+	EndCursor   string `json:"endCursor"`
+}
+
+// ListIssues fetches all issues matching the filter criteria, following
+// pagination cursors until exhausted.
 func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Issue, error) {
 	query := `
-		query ListIssues($teamId: String!, $label: String!, $states: [String!]) {
+		query ListIssues($teamId: String!, $label: String!, $states: [String!], $first: Int!, $after: String) {
 			issues(
 				filter: {
 					team: { key: { eq: $teamId } }
 					labels: { name: { eq: $label } }
 					state: { type: { in: $states } }
 				}
-				first: 50
+				first: $first
+				after: $after
 				orderBy: createdAt
 			) {
 				nodes {
@@ -287,6 +299,7 @@ func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Is
 					createdAt
 					updatedAt
 				}
+				pageInfo { hasNextPage endCursor }
 			}
 		}
 	`
@@ -296,31 +309,121 @@ func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Is
 		states = []string{"backlog", "unstarted", "started"}
 	}
 
-	variables := map[string]interface{}{
-		"teamId": opts.TeamID,
-		"label":  opts.Label,
-		"states": states,
+	var issues []*Issue
+	after := ""
+	for {
+		variables := map[string]interface{}{
+			"teamId": opts.TeamID,
+			"label":  opts.Label,
+			"states": states,
+			"first":  listIssuesPageSize,
+		}
+		if after != "" {
+			variables["after"] = after
+		}
+
+		var result struct {
+			Issues struct {
+				Nodes    []*issueListItem `json:"nodes"`
+				PageInfo pageInfo         `json:"pageInfo"`
+			} `json:"issues"`
+		}
+
+		if err := c.Execute(ctx, query, variables, &result); err != nil {
+			return nil, err
+		}
+
+		for _, resp := range result.Issues.Nodes {
+			issue := resp.toIssue()
+			if len(opts.ProjectIDs) > 0 {
+				if issue.Project == nil || !containsString(opts.ProjectIDs, issue.Project.ID) {
+					continue
+				}
+			}
+			issues = append(issues, issue)
+		}
+
+		if !result.Issues.PageInfo.HasNextPage {
+			break
+		}
+		after = result.Issues.PageInfo.EndCursor
 	}
 
-	var result struct {
-		Issues struct {
-			Nodes []*issueListItem `json:"nodes"`
-		} `json:"issues"`
-	}
+	return issues, nil
+}
 
-	if err := c.Execute(ctx, query, variables, &result); err != nil {
-		return nil, err
-	}
+// ListIssuesSinceOptions configures a delta issue listing.
+type ListIssuesSinceOptions struct {
+	TeamID string
+	Since  time.Time
+}
 
-	issues := make([]*Issue, 0, len(result.Issues.Nodes))
-	for _, resp := range result.Issues.Nodes {
-		issue := resp.toIssue()
-		if len(opts.ProjectIDs) > 0 {
-			if issue.Project == nil || !containsString(opts.ProjectIDs, issue.Project.ID) {
-				continue
+// ListIssuesSince fetches all issues whose updatedAt is strictly greater than
+// since, ordered by updatedAt, following pagination cursors until exhausted.
+// It is intended for delta polling with a watermark cursor rather than a full
+// refetch on every poll.
+func (c *Client) ListIssuesSince(ctx context.Context, opts *ListIssuesSinceOptions) ([]*Issue, error) {
+	query := `
+		query ListIssuesSince($teamId: String!, $since: DateTimeOrDuration!, $first: Int!, $after: String) {
+			issues(
+				filter: {
+					team: { key: { eq: $teamId } }
+					updatedAt: { gt: $since }
+				}
+				first: $first
+				after: $after
+				orderBy: updatedAt
+			) {
+				nodes {
+					id
+					identifier
+					title
+					description
+					priority
+					state { id name type }
+					labels { nodes { id name } }
+					assignee { id name email }
+					project { id name }
+					team { id name key }
+					createdAt
+					updatedAt
+				}
+				pageInfo { hasNextPage endCursor }
 			}
 		}
-		issues = append(issues, issue)
+	`
+
+	var issues []*Issue
+	after := ""
+	for {
+		variables := map[string]interface{}{
+			"teamId": opts.TeamID,
+			"since":  opts.Since.UTC().Format(time.RFC3339),
+			"first":  listIssuesPageSize,
+		}
+		if after != "" {
+			variables["after"] = after
+		}
+
+		var result struct {
+			Issues struct {
+				Nodes    []*issueListItem `json:"nodes"`
+				PageInfo pageInfo         `json:"pageInfo"`
+			} `json:"issues"`
+		}
+
+		if err := c.Execute(ctx, query, variables, &result); err != nil {
+			return nil, err
+		}
+
+		for _, resp := range result.Issues.Nodes {
+			issues = append(issues, resp.toIssue())
+		}
+
+		if !result.Issues.PageInfo.HasNextPage {
+			break
+		}
+		after = result.Issues.PageInfo.EndCursor
 	}
 
 	return issues, nil
