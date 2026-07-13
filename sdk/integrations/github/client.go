@@ -250,7 +250,9 @@ func (c *Client) GetIssue(ctx context.Context, owner, repo string, number int) (
 	return &issue, nil
 }
 
-// ListIssueComments returns all comments on an issue or PR.
+// ListIssueComments returns comments on an issue or PR.
+// Intentionally single-page (no per_page/page params): callers use this for
+// small comment threads on individual issues/PRs, not board-scale listing.
 func (c *Client) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]*Comment, error) {
 	path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, number)
 	var comments []*Comment
@@ -395,8 +397,13 @@ func (c *Client) AddPRComment(ctx context.Context, owner, repo string, number in
 // ListIssues lists issues for a repository with optional filters.
 // Note: Labels are filtered case-insensitively in Go code after fetching,
 // because GitHub API label queries are case-sensitive.
+// Results are paginated at 100 per page. A safety cap of 50 pages prevents
+// runaway loops on very large repos (mirrors ListPullRequests).
 func (c *Client) ListIssues(ctx context.Context, owner, repo string, opts *ListIssuesOptions) ([]*Issue, error) {
-	path := fmt.Sprintf("/repos/%s/%s/issues?", owner, repo)
+	const perPage = 100
+	const maxPages = 50
+
+	basePath := fmt.Sprintf("/repos/%s/%s/issues?", owner, repo)
 
 	params := []string{}
 	var filterLabels []string
@@ -413,16 +420,21 @@ func (c *Client) ListIssues(ctx context.Context, owner, repo string, opts *ListI
 		}
 	}
 
-	for i, p := range params {
-		if i > 0 {
-			path += "&"
-		}
-		path += p
+	for _, p := range params {
+		basePath += p + "&"
 	}
 
 	var issues []*Issue
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &issues); err != nil {
-		return nil, err
+	for page := 1; page <= maxPages; page++ {
+		path := fmt.Sprintf("%sper_page=%d&page=%d", basePath, perPage, page)
+		var batch []*Issue
+		if err := c.doRequest(ctx, http.MethodGet, path, nil, &batch); err != nil {
+			return nil, err
+		}
+		issues = append(issues, batch...)
+		if len(batch) < perPage {
+			break
+		}
 	}
 
 	// Filter by labels case-insensitively
@@ -619,24 +631,48 @@ func (c *Client) UpdateRelease(ctx context.Context, owner, repo string, releaseI
 	return &result, nil
 }
 
-// ListReleases lists releases for a repository (newest first)
+// ListReleases lists releases for a repository (newest first).
+// Paginates exhaustively using perPage as the page size, up to a 50-page
+// safety cap (mirrors ListPullRequests) — a single page silently truncated
+// releases in repos with more than perPage entries.
 func (c *Client) ListReleases(ctx context.Context, owner, repo string, perPage int) ([]*Release, error) {
-	path := fmt.Sprintf("/repos/%s/%s/releases?per_page=%d", owner, repo, perPage)
-	var result []*Release
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
-		return nil, err
+	const maxPages = 50
+
+	var all []*Release
+	for page := 1; page <= maxPages; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/releases?per_page=%d&page=%d", owner, repo, perPage, page)
+		var batch []*Release
+		if err := c.doRequest(ctx, http.MethodGet, path, nil, &batch); err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		if len(batch) < perPage {
+			break
+		}
 	}
-	return result, nil
+	return all, nil
 }
 
-// ListTags lists repository tags (newest first)
+// ListTags lists repository tags (newest first).
+// Paginates exhaustively using perPage as the page size, up to a 50-page
+// safety cap (mirrors ListPullRequests) — a single page silently truncated
+// tags in repos with more than perPage entries.
 func (c *Client) ListTags(ctx context.Context, owner, repo string, perPage int) ([]*Tag, error) {
-	path := fmt.Sprintf("/repos/%s/%s/tags?per_page=%d", owner, repo, perPage)
-	var result []*Tag
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
-		return nil, err
+	const maxPages = 50
+
+	var all []*Tag
+	for page := 1; page <= maxPages; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/tags?per_page=%d&page=%d", owner, repo, perPage, page)
+		var batch []*Tag
+		if err := c.doRequest(ctx, http.MethodGet, path, nil, &batch); err != nil {
+			return nil, err
+		}
+		all = append(all, batch...)
+		if len(batch) < perPage {
+			break
+		}
 	}
-	return result, nil
+	return all, nil
 }
 
 // GetTagForSHA returns the tag name if a tag exists at the given SHA, or empty
@@ -844,6 +880,9 @@ func (c *Client) HasApprovalReview(ctx context.Context, owner, repo string, numb
 }
 
 // GetPullRequestComments returns line-level review comments on a pull request.
+// Intentionally single-page (per_page=100, no page loop): review comment
+// counts on a single PR stay well under 100 in practice, unlike board-scale
+// issue/release/tag listings.
 func (c *Client) GetPullRequestComments(ctx context.Context, owner, repo string, number int) ([]*PRReviewComment, error) {
 	path := fmt.Sprintf("/repos/%s/%s/pulls/%d/comments?per_page=100", owner, repo, number)
 	var result []*PRReviewComment
@@ -962,6 +1001,9 @@ func (c *Client) executeGraphQLCore(ctx context.Context, query string, variables
 }
 
 // SearchPRsForIssue returns all PRs that reference the given issue number.
+// Intentionally single-page (per_page=100, no page loop): the Search API's
+// own result cap (1000 items) makes this a bounded lookup for one issue's
+// referencing PRs, not the kind of board-scale listing ListIssues covers.
 func (c *Client) SearchPRsForIssue(ctx context.Context, owner, repo string, issueNumber int) ([]*PullRequest, error) {
 	q := fmt.Sprintf("repo:%s/%s is:pr #%d", owner, repo, issueNumber)
 	path := fmt.Sprintf("/search/issues?q=%s&per_page=100", url.QueryEscape(q))
@@ -1003,6 +1045,8 @@ func (c *Client) SearchPRsForIssue(ctx context.Context, owner, repo string, issu
 // SearchOpenPRsForIssue returns open PRs that reference the given issue number.
 // The returned PullRequest values include the User (author) field so callers can
 // distinguish Pilot-bot PRs from human recovery PRs.
+// Intentionally single-page (per_page=100, no page loop): open PRs against a
+// single issue are a small, bounded set, unlike board-scale listing.
 func (c *Client) SearchOpenPRsForIssue(ctx context.Context, owner, repo string, issueNumber int) ([]*PullRequest, error) {
 	q := fmt.Sprintf("repo:%s/%s is:pr is:open #%d", owner, repo, issueNumber)
 	path := fmt.Sprintf("/search/issues?q=%s&per_page=100", url.QueryEscape(q))
