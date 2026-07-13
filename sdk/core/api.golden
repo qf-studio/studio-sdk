@@ -55,6 +55,8 @@ type ChatDeps struct {
 	Handler MessageHandler
 }
 
+type Cursor string
+
 type ExecutionChecker interface {
 	HasCompletedExecution(taskID, projectPath string) (bool, error)
 	InvalidateCompletion(taskID, projectPath string) error
@@ -64,10 +66,19 @@ type ExecutionSaver interface {
 	SaveDeclinedExecution(taskID, projectPath, status, reason string) error
 }
 
+type FieldPatch map[string]any
+
 type Identity struct {
 	UserID string
 	DisplayName string
 	IsBot bool
+}
+
+type IssueDraft struct {
+	Title string
+	Body string
+	Labels []string
+	Priority string
 }
 
 type IssueEvent struct {
@@ -100,6 +111,22 @@ type IssueResult struct {
 	HeadSHA string
 	BranchName string
 	Error error
+}
+
+type IssueSnapshot struct {
+	NativeID string
+	SequenceID string
+	Title string
+	Body string
+	State string
+	StateGroup string
+	Labels []string
+	Priority string
+	Assignee string
+	URL string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+	Deleted bool
 }
 
 type MessageEvent struct {
@@ -179,6 +206,24 @@ type ProcessedStore interface {
 
 type RateLimitScheduler interface {
 	QueueRetryIfRateLimited(taskID, title, body, errText string) bool
+}
+
+type SyncCapable interface {
+	SyncSource
+	SyncWriter
+}
+
+type SyncSource interface {
+	ListUpdatedSince(ctx context.Context, projectID string, since time.Time, page Cursor) ([]IssueSnapshot, Cursor, error)
+	ListAll(ctx context.Context, projectID string, page Cursor) ([]IssueSnapshot, Cursor, error)
+	GetIssue(ctx context.Context, nativeID string) (IssueSnapshot, error)
+}
+
+type SyncWriter interface {
+	UpdateFields(ctx context.Context, nativeID string, fields FieldPatch) (IssueSnapshot, error)
+	TransitionState(ctx context.Context, nativeID, providerState string) error
+	AddComment(ctx context.Context, nativeID, body, idemKey string) error
+	CreateIssue(ctx context.Context, projectID string, draft IssueDraft) (IssueSnapshot, error)
 }
 
 type TaskChecker interface {
