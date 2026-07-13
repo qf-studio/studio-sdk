@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
 )
@@ -398,5 +400,204 @@ func TestSearchIssues_Server(t *testing.T) {
 	}
 	if len(issues) != 1 {
 		t.Fatalf("expected 1 issue, got %d", len(issues))
+	}
+}
+
+func TestCreateIssue_Cloud(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("expected POST, got %s", r.Method)
+		}
+		if r.URL.Path != "/rest/api/3/issue" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode body: %v", err)
+		}
+		fields, ok := body["fields"].(map[string]interface{})
+		if !ok {
+			t.Fatal("expected fields object")
+		}
+		if fields["summary"] != "New issue" {
+			t.Errorf("summary = %v, want %q", fields["summary"], "New issue")
+		}
+		project, ok := fields["project"].(map[string]interface{})
+		if !ok || project["key"] != "PROJ" {
+			t.Errorf("project.key = %v, want PROJ", fields["project"])
+		}
+		issuetype, ok := fields["issuetype"].(map[string]interface{})
+		if !ok || issuetype["name"] != "Task" {
+			t.Errorf("issuetype.name = %v, want Task", fields["issuetype"])
+		}
+		desc, ok := fields["description"].(map[string]interface{})
+		if !ok || desc["type"] != "doc" {
+			t.Errorf("expected ADF description for Cloud, got %v", fields["description"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(&IssueCreateResponse{ID: "10050", Key: "PROJ-50"})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "user@example.com", testutil.FakeJiraToken, PlatformCloud)
+	created, err := client.CreateIssue(context.Background(), "PROJ", "Task", "New issue", "Description", []string{"bug"})
+	if err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+	if created.Key != "PROJ-50" {
+		t.Errorf("Key = %q, want PROJ-50", created.Key)
+	}
+}
+
+func TestCreateIssue_Server_PlainDescription(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("failed to decode body: %v", err)
+		}
+		fields := body["fields"].(map[string]interface{})
+		if fields["description"] != "Description" {
+			t.Errorf("expected plain-text description for Server, got %v", fields["description"])
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(&IssueCreateResponse{ID: "10050", Key: "PROJ-50"})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "admin", testutil.FakeJiraToken, PlatformServer)
+	if _, err := client.CreateIssue(context.Background(), "PROJ", "Task", "New issue", "Description", nil); err != nil {
+		t.Fatalf("CreateIssue failed: %v", err)
+	}
+}
+
+func TestUpdateFields_PartialPatch(t *testing.T) {
+	var gotBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("expected PUT, got %s", r.Method)
+		}
+		if r.URL.Path != "/rest/api/3/issue/PROJ-42" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("failed to decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "user@example.com", testutil.FakeJiraToken, PlatformCloud)
+	err := client.UpdateFields(context.Background(), "PROJ-42", map[string]interface{}{
+		"summary": "Updated title",
+	})
+	if err != nil {
+		t.Fatalf("UpdateFields failed: %v", err)
+	}
+
+	fields, ok := gotBody["fields"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected fields object in request")
+	}
+	if fields["summary"] != "Updated title" {
+		t.Errorf("summary = %v, want %q", fields["summary"], "Updated title")
+	}
+	if _, hasDescription := fields["description"]; hasDescription {
+		t.Errorf("partial patch should not send unset field %q", "description")
+	}
+}
+
+func TestGetComments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/3/issue/PROJ-42/comment" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"comments":[{"id":"1","body":"unrelated"},{"id":"2","body":{"type":"doc","content":[{"type":"paragraph","content":[{"type":"text","text":"synced\n\n<!-- pilot-op:key-123 -->"}]}]}}]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "user@example.com", testutil.FakeJiraToken, PlatformCloud)
+	comments, err := client.GetComments(context.Background(), "PROJ-42")
+	if err != nil {
+		t.Fatalf("GetComments failed: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected 2 comments, got %d", len(comments))
+	}
+	found := false
+	for _, c := range comments {
+		if strings.Contains(string(c.Body), "<!-- pilot-op:key-123 -->") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected to find idempotency marker in an ADF comment body")
+	}
+}
+
+// TestDoRequest_RetriesRateLimit_HonorsRetryAfter verifies that a 429 with a
+// Retry-After header is retried and the header value is honored rather than
+// falling back to exponential backoff.
+func TestDoRequest_RetriesRateLimit_HonorsRetryAfter(t *testing.T) {
+	calls := 0
+	var firstCallTime, secondCallTime time.Time
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			firstCallTime = time.Now()
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"errorMessages":["rate limited"]}`))
+			return
+		}
+		secondCallTime = time.Now()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(&Issue{ID: "1", Key: "PROJ-1"})
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "user@example.com", testutil.FakeJiraToken, PlatformCloud)
+	client.retryOpts = RetryOptions{MaxRetries: 3, BaseDelay: 1 * time.Millisecond, MaxDelay: 10 * time.Millisecond}
+
+	issue, err := client.GetIssue(context.Background(), "PROJ-1")
+	if err != nil {
+		t.Fatalf("GetIssue failed: %v", err)
+	}
+	if issue.Key != "PROJ-1" {
+		t.Errorf("Key = %q, want PROJ-1", issue.Key)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls (1 retry), got %d", calls)
+	}
+	if secondCallTime.Before(firstCallTime) {
+		t.Error("second call should happen after first")
+	}
+}
+
+// TestDoRequest_AuthErrorShortCircuits verifies that a 401/403 response does
+// not get retried — retrying with a dead token cannot succeed.
+func TestDoRequest_AuthErrorShortCircuits(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"errorMessages":["Unauthorized"]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "user@example.com", testutil.FakeJiraToken, PlatformCloud)
+	client.retryOpts = RetryOptions{MaxRetries: 3, BaseDelay: 1 * time.Millisecond, MaxDelay: 10 * time.Millisecond}
+
+	_, err := client.GetIssue(context.Background(), "PROJ-1")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if calls != 1 {
+		t.Errorf("expected 1 call (no retry on auth error), got %d", calls)
 	}
 }

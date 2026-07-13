@@ -19,16 +19,18 @@ type Client struct {
 	apiToken   string
 	platform   string
 	httpClient *http.Client
+	retryOpts  RetryOptions // Retry config for doRequest; overridable in tests
 }
 
 // NewClient creates a new Jira client.
 func NewClient(baseURL, username, apiToken, platform string) *Client {
 	baseURL = strings.TrimSuffix(baseURL, "/")
 	return &Client{
-		baseURL:  baseURL,
-		username: username,
-		apiToken: apiToken,
-		platform: platform,
+		baseURL:   baseURL,
+		username:  username,
+		apiToken:  apiToken,
+		platform:  platform,
+		retryOpts: DefaultRetryOptions(),
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
@@ -43,52 +45,68 @@ func (c *Client) apiPath() string {
 	return "/rest/api/2"
 }
 
-// doRequest performs an HTTP request to the Jira API.
+// doRequest performs an HTTP request to the Jira API with automatic retry on
+// transient errors (429 with Retry-After honored). The request body is
+// buffered once before the retry loop so it can be replayed on each attempt.
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}, result interface{}) error {
-	var bodyReader io.Reader
+	var bodyBytes []byte
 	if body != nil {
-		bodyBytes, err := json.Marshal(body)
+		var err error
+		bodyBytes, err = json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("failed to marshal request body: %w", err)
 		}
-		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
-	url := c.baseURL + c.apiPath() + path
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	auth := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.apiToken))
-	req.Header.Set("Authorization", "Basic "+auth)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
-	}
-
-	if result != nil && len(respBody) > 0 {
-		if err := json.Unmarshal(respBody, result); err != nil {
-			return fmt.Errorf("failed to parse response: %w", err)
+	return WithRetryVoid(ctx, func() error {
+		var bodyReader io.Reader
+		if bodyBytes != nil {
+			bodyReader = bytes.NewReader(bodyBytes)
 		}
-	}
 
-	return nil
+		url := c.baseURL + c.apiPath() + path
+		req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+		if err != nil {
+			return fmt.Errorf("failed to create request: %w", err)
+		}
+
+		auth := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.apiToken))
+		req.Header.Set("Authorization", "Basic "+auth)
+		req.Header.Set("Accept", "application/json")
+		if bodyBytes != nil {
+			req.Header.Set("Content-Type", "application/json")
+		}
+
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("failed to execute request: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to read response: %w", err)
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			msg := string(respBody)
+			switch resp.StatusCode {
+			case http.StatusUnauthorized, http.StatusForbidden:
+				return &AuthError{StatusCode: resp.StatusCode, Message: msg}
+			case http.StatusTooManyRequests:
+				return &RateLimitError{RetryAfter: parseRetryAfterHeader(resp.Header), Message: msg}
+			}
+			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, msg)
+		}
+
+		if result != nil && len(respBody) > 0 {
+			if err := json.Unmarshal(respBody, result); err != nil {
+				return fmt.Errorf("failed to parse response: %w", err)
+			}
+		}
+
+		return nil
+	}, c.retryOpts)
 }
 
 // GetIssue fetches an issue by key (e.g., "PROJ-42").
@@ -99,6 +117,79 @@ func (c *Client) GetIssue(ctx context.Context, issueKey string) (*Issue, error) 
 		return nil, err
 	}
 	return &issue, nil
+}
+
+// IssueCreateResponse is the response from POST /issue.
+type IssueCreateResponse struct {
+	ID   string `json:"id"`
+	Key  string `json:"key"`
+	Self string `json:"self"`
+}
+
+// descriptionBody renders text as the platform-appropriate description
+// payload: ADF for Cloud, plain string for Server (mirrors AddComment).
+func (c *Client) descriptionBody(text string) interface{} {
+	if c.platform == PlatformCloud {
+		return map[string]interface{}{
+			"type":    "doc",
+			"version": 1,
+			"content": []map[string]interface{}{
+				{
+					"type": "paragraph",
+					"content": []map[string]interface{}{
+						{"type": "text", "text": text},
+					},
+				},
+			},
+		}
+	}
+	return text
+}
+
+// CreateIssue creates a new issue in projectKey with the given summary,
+// description, labels, and issue type name (e.g. "Task", "Bug"). It returns
+// the created issue's id/key; callers needing the full issue should follow up
+// with GetIssue.
+func (c *Client) CreateIssue(ctx context.Context, projectKey, issueType, summary, description string, labels []string) (*IssueCreateResponse, error) {
+	fields := map[string]interface{}{
+		"project":   map[string]string{"key": projectKey},
+		"issuetype": map[string]string{"name": issueType},
+		"summary":   summary,
+	}
+	if description != "" {
+		fields["description"] = c.descriptionBody(description)
+	}
+	if len(labels) > 0 {
+		fields["labels"] = labels
+	}
+	reqBody := map[string]interface{}{"fields": fields}
+
+	var created IssueCreateResponse
+	if err := c.doRequest(ctx, http.MethodPost, "/issue", reqBody, &created); err != nil {
+		return nil, err
+	}
+	return &created, nil
+}
+
+// UpdateFields applies a partial field patch to an issue via PUT /issue/{key}.
+// fields is a map of Jira field names (e.g. "summary", "description",
+// "labels") to their new values; description values are rendered through
+// descriptionBody so callers pass plain text regardless of platform.
+func (c *Client) UpdateFields(ctx context.Context, issueKey string, fields map[string]interface{}) error {
+	patched := make(map[string]interface{}, len(fields))
+	for k, v := range fields {
+		if k == "description" {
+			if s, ok := v.(string); ok {
+				patched[k] = c.descriptionBody(s)
+				continue
+			}
+		}
+		patched[k] = v
+	}
+
+	path := fmt.Sprintf("/issue/%s", issueKey)
+	reqBody := map[string]interface{}{"fields": patched}
+	return c.doRequest(ctx, http.MethodPut, path, reqBody, nil)
 }
 
 // AddComment adds a comment to an issue.
@@ -135,6 +226,29 @@ func (c *Client) AddComment(ctx context.Context, issueKey, body string) (*Commen
 		return nil, err
 	}
 	return &comment, nil
+}
+
+// rawComment is a comment with its body left as raw JSON: Cloud renders body
+// as an ADF object, Server as a plain string, and idempotency-marker lookups
+// only need to substring-match the raw bytes, not decode either shape.
+type rawComment struct {
+	ID   string          `json:"id"`
+	Body json.RawMessage `json:"body"`
+}
+
+type commentsListResponse struct {
+	Comments []rawComment `json:"comments"`
+}
+
+// GetComments lists an issue's comments with bodies left undecoded, for
+// idempotency-marker scanning (see sync.go AddComment).
+func (c *Client) GetComments(ctx context.Context, issueKey string) ([]rawComment, error) {
+	path := fmt.Sprintf("/issue/%s/comment", issueKey)
+	var resp commentsListResponse
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return resp.Comments, nil
 }
 
 // GetTransitions fetches available transitions for an issue.
@@ -248,6 +362,37 @@ func (c *Client) SearchIssues(ctx context.Context, jql string, maxResults int) (
 		return nil, err
 	}
 	return resp.Issues, nil
+}
+
+// SearchIssuesPaged searches for issues using JQL, paged by startAt/maxResults
+// (used by SyncClient's exhaustive delta/full listings, which need a stable
+// numeric cursor rather than Cloud's opaque nextPageToken).
+func (c *Client) SearchIssuesPaged(ctx context.Context, jql string, startAt, maxResults int) (*SearchResponse, error) {
+	if maxResults <= 0 {
+		maxResults = 50
+	}
+
+	if c.platform == PlatformCloud {
+		reqBody := map[string]interface{}{
+			"jql":        jql,
+			"startAt":    startAt,
+			"maxResults": maxResults,
+			"fields":     []string{"*all"},
+		}
+		var resp SearchResponse
+		if err := c.doRequest(ctx, http.MethodPost, "/search/jql", reqBody, &resp); err != nil {
+			return nil, err
+		}
+		resp.StartAt = startAt
+		return &resp, nil
+	}
+
+	path := fmt.Sprintf("/search?jql=%s&startAt=%d&maxResults=%d", strings.ReplaceAll(jql, " ", "+"), startAt, maxResults)
+	var resp SearchResponse
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, err
+	}
+	return &resp, nil
 }
 
 // AddLabel adds a label to an issue.
