@@ -327,14 +327,19 @@ func TestSyncAdapter_UpdateFields_Labels(t *testing.T) {
 	}
 }
 
-func TestSyncAdapter_TransitionState(t *testing.T) {
+func TestSyncAdapter_TransitionState_UUID(t *testing.T) {
+	const stateUUID = "12345678-90ab-cdef-1234-567890abcdef"
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var reqBody GraphQLRequest
 		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
 			t.Fatalf("failed to decode request: %v", err)
 		}
-		if reqBody.Variables["stateId"] != "state-456" {
-			t.Errorf("variables[stateId] = %v, want state-456", reqBody.Variables["stateId"])
+		if strings.Contains(reqBody.Query, "workflowStates") || strings.Contains(reqBody.Query, "issue(id:") {
+			t.Fatalf("state UUID input should not trigger a lookup query, got: %s", reqBody.Query)
+		}
+		if reqBody.Variables["stateId"] != stateUUID {
+			t.Errorf("variables[stateId] = %v, want %s", reqBody.Variables["stateId"], stateUUID)
 		}
 		_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{"issueUpdate": {"success": true}}`)})
 	}))
@@ -343,8 +348,49 @@ func TestSyncAdapter_TransitionState(t *testing.T) {
 	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
 	sa := NewSyncAdapter(client)
 
-	if err := sa.TransitionState(context.Background(), "issue-1", "state-456"); err != nil {
+	if err := sa.TransitionState(context.Background(), "issue-1", stateUUID); err != nil {
 		t.Fatalf("TransitionState failed: %v", err)
+	}
+}
+
+func TestSyncAdapter_TransitionState_Name(t *testing.T) {
+	const resolvedStateID = "state-uuid-1"
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+
+		switch {
+		case strings.Contains(reqBody.Query, "issue(id:"):
+			body := `{"issue": ` + issueNodeJSON("issue-1", "ENG-1") + `}`
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+		case strings.Contains(reqBody.Query, "workflowStates"):
+			if reqBody.Variables["teamKey"] != "ENG" {
+				t.Errorf("variables[teamKey] = %v, want ENG", reqBody.Variables["teamKey"])
+			}
+			body := `{"workflowStates": {"nodes": [
+				{"id": "` + resolvedStateID + `", "name": "In Progress"},
+				{"id": "state-uuid-2", "name": "Done"}
+			]}}`
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+		case strings.Contains(reqBody.Query, "issueUpdate"):
+			if reqBody.Variables["stateId"] != resolvedStateID {
+				t.Errorf("variables[stateId] = %v, want %s", reqBody.Variables["stateId"], resolvedStateID)
+			}
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{"issueUpdate": {"success": true}}`)})
+		default:
+			t.Fatalf("unexpected query: %s", reqBody.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+	sa := NewSyncAdapter(client)
+
+	if err := sa.TransitionState(context.Background(), "issue-1", "In Progress"); err != nil {
+		t.Fatalf("TransitionState (by name) failed: %v", err)
 	}
 }
 
@@ -393,6 +439,130 @@ func TestSyncAdapter_AddComment_Idempotent(t *testing.T) {
 	}
 	if commentCreateCalls != 1 {
 		t.Fatalf("commentCreateCalls = %d, want still 1 after idempotent retry", commentCreateCalls)
+	}
+}
+
+func TestSyncAdapter_AddComment_IdempotentAcrossPages(t *testing.T) {
+	commentCreateCalls := 0
+	commentQueries := 0
+	marker := syncCommentMarker("sync-key-page2")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+
+		switch {
+		case strings.Contains(reqBody.Query, "comments"):
+			commentQueries++
+			if commentQueries == 1 {
+				if _, hasAfter := reqBody.Variables["after"]; hasAfter {
+					t.Errorf("first comments page should not set 'after'")
+				}
+				body := `{"issue": {"comments": {
+					"nodes": [{"id": "c1", "body": "unrelated comment"}],
+					"pageInfo": {"hasNextPage": true, "endCursor": "cpage-2"}
+				}}}`
+				_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+				return
+			}
+			if reqBody.Variables["after"] != "cpage-2" {
+				t.Errorf("second page should pass through the returned cursor, got %v", reqBody.Variables["after"])
+			}
+			body := `{"issue": {"comments": {
+				"nodes": [{"id": "c2", "body": "Synced\n\n` + marker + `"}],
+				"pageInfo": {"hasNextPage": false, "endCursor": ""}
+			}}}`
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+		case strings.Contains(reqBody.Query, "commentCreate"):
+			commentCreateCalls++
+			_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(`{"commentCreate": {"success": true}}`)})
+		default:
+			t.Fatalf("unexpected query: %s", reqBody.Query)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+	sa := NewSyncAdapter(client)
+
+	if err := sa.AddComment(context.Background(), "issue-1", "Synced", "sync-key-page2"); err != nil {
+		t.Fatalf("AddComment failed: %v", err)
+	}
+	if commentQueries != 2 {
+		t.Fatalf("commentQueries = %d, want 2 (marker found on page 2)", commentQueries)
+	}
+	if commentCreateCalls != 0 {
+		t.Fatalf("commentCreateCalls = %d, want 0 — marker on page 2 should have been found", commentCreateCalls)
+	}
+}
+
+func TestSyncAdapter_ListUpdatedSince_OnOrAfter(t *testing.T) {
+	since := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reqBody GraphQLRequest
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("failed to decode request: %v", err)
+		}
+		if reqBody.Variables["since"] != since.Format(time.RFC3339Nano) {
+			t.Errorf("variables[since] = %v, want %s (RFC3339Nano)", reqBody.Variables["since"], since.Format(time.RFC3339Nano))
+		}
+		if !strings.Contains(reqBody.Query, "gte") {
+			t.Errorf("query must use gte (on-or-after) semantics, got: %s", reqBody.Query)
+		}
+
+		body := `{"issues": {"nodes": [` + issueNodeJSON("issue-1", "ENG-1") + `],
+			"pageInfo": {"hasNextPage": false, "endCursor": ""}}}`
+		_ = json.NewEncoder(w).Encode(GraphQLResponse{Data: json.RawMessage(body)})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+	sa := NewSyncAdapter(client)
+
+	snaps, _, err := sa.ListUpdatedSince(context.Background(), "ENG", since, "")
+	if err != nil {
+		t.Fatalf("ListUpdatedSince failed: %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("snaps = %+v, want 1 (issue updated exactly at since should be included)", snaps)
+	}
+}
+
+func TestSyncAdapter_UpdateFields_UnknownKey(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("no request should be made when the patch has an unrecognized key")
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+	sa := NewSyncAdapter(client)
+
+	_, err := sa.UpdateFields(context.Background(), "issue-1", core.FieldPatch{
+		"title":      "New title",
+		"assignedTo": "someone",
+	})
+	if err == nil {
+		t.Fatal("UpdateFields with unknown key should return an error")
+	}
+}
+
+func TestSyncAdapter_UpdateFields_WrongType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("no request should be made when a recognized field has the wrong type")
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+	sa := NewSyncAdapter(client)
+
+	_, err := sa.UpdateFields(context.Background(), "issue-1", core.FieldPatch{
+		"priority": 2,
+	})
+	if err == nil {
+		t.Fatal("UpdateFields with wrongly-typed priority should return an error")
 	}
 }
 
