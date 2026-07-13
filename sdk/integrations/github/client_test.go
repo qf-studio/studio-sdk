@@ -3472,6 +3472,200 @@ func TestListPullRequests_SinglePage(t *testing.T) {
 	}
 }
 
+// TestListIssues_Pagination verifies ListIssues follows pages exhaustively
+// (per_page=100) instead of silently truncating at GitHub's default 30-item page.
+func TestListIssues_Pagination(t *testing.T) {
+	page1 := make([]*Issue, 100)
+	for i := range page1 {
+		page1[i] = &Issue{Number: i + 1, Title: fmt.Sprintf("Issue %d", i+1)}
+	}
+	page2 := []*Issue{
+		{Number: 101, Title: "Issue 101"},
+		{Number: 102, Title: "Issue 102"},
+		{Number: 103, Title: "Issue 103"},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if perPage := q.Get("per_page"); perPage != "100" {
+			t.Errorf("per_page = %q, want 100", perPage)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if q.Get("page") == "2" {
+			_ = json.NewEncoder(w).Encode(page2)
+		} else {
+			_ = json.NewEncoder(w).Encode(page1)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	issues, err := client.ListIssues(context.Background(), "owner", "repo", nil)
+	if err != nil {
+		t.Fatalf("ListIssues() error = %v", err)
+	}
+	if len(issues) != 103 {
+		t.Errorf("got %d issues, want 103", len(issues))
+	}
+	seen := make(map[int]bool)
+	for _, iss := range issues {
+		seen[iss.Number] = true
+	}
+	for n := 1; n <= 103; n++ {
+		if !seen[n] {
+			t.Errorf("missing issue #%d in union of pages", n)
+		}
+	}
+}
+
+// TestListIssues_SinglePage verifies a response shorter than per_page stops
+// pagination after one request.
+func TestListIssues_SinglePage(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]*Issue{{Number: 1, Title: "Issue 1"}})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	issues, err := client.ListIssues(context.Background(), "owner", "repo", nil)
+	if err != nil {
+		t.Fatalf("ListIssues() error = %v", err)
+	}
+	if len(issues) != 1 {
+		t.Errorf("got %d issues, want 1", len(issues))
+	}
+	if calls != 1 {
+		t.Errorf("server called %d times, want 1 (single page should stop)", calls)
+	}
+}
+
+// TestListReleases_Pagination verifies ListReleases follows pages exhaustively.
+func TestListReleases_Pagination(t *testing.T) {
+	page1 := make([]*Release, 100)
+	for i := range page1 {
+		page1[i] = &Release{ID: int64(i + 1), TagName: fmt.Sprintf("v%d", i+1)}
+	}
+	page2 := []*Release{
+		{ID: 101, TagName: "v101"},
+		{ID: 102, TagName: "v102"},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if perPage := q.Get("per_page"); perPage != "100" {
+			t.Errorf("per_page = %q, want 100", perPage)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if q.Get("page") == "2" {
+			_ = json.NewEncoder(w).Encode(page2)
+		} else {
+			_ = json.NewEncoder(w).Encode(page1)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	releases, err := client.ListReleases(context.Background(), "owner", "repo", 100)
+	if err != nil {
+		t.Fatalf("ListReleases() error = %v", err)
+	}
+	if len(releases) != 102 {
+		t.Errorf("got %d releases, want 102", len(releases))
+	}
+}
+
+// TestListReleases_SinglePage verifies a response shorter than per_page stops
+// pagination after one request.
+func TestListReleases_SinglePage(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]*Release{{ID: 1, TagName: "v1"}})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	releases, err := client.ListReleases(context.Background(), "owner", "repo", 100)
+	if err != nil {
+		t.Fatalf("ListReleases() error = %v", err)
+	}
+	if len(releases) != 1 {
+		t.Errorf("got %d releases, want 1", len(releases))
+	}
+	if calls != 1 {
+		t.Errorf("server called %d times, want 1 (single page should stop)", calls)
+	}
+}
+
+// TestListTags_Pagination verifies ListTags follows pages exhaustively.
+func TestListTags_Pagination(t *testing.T) {
+	page1 := make([]*Tag, 100)
+	for i := range page1 {
+		page1[i] = &Tag{Name: fmt.Sprintf("v%d", i+1)}
+	}
+	page2 := []*Tag{
+		{Name: "v101"},
+		{Name: "v102"},
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if perPage := q.Get("per_page"); perPage != "100" {
+			t.Errorf("per_page = %q, want 100", perPage)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if q.Get("page") == "2" {
+			_ = json.NewEncoder(w).Encode(page2)
+		} else {
+			_ = json.NewEncoder(w).Encode(page1)
+		}
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	tags, err := client.ListTags(context.Background(), "owner", "repo", 100)
+	if err != nil {
+		t.Fatalf("ListTags() error = %v", err)
+	}
+	if len(tags) != 102 {
+		t.Errorf("got %d tags, want 102", len(tags))
+	}
+}
+
+// TestListTags_SinglePage verifies a response shorter than per_page stops
+// pagination after one request.
+func TestListTags_SinglePage(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]*Tag{{Name: "v1"}})
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	tags, err := client.ListTags(context.Background(), "owner", "repo", 100)
+	if err != nil {
+		t.Fatalf("ListTags() error = %v", err)
+	}
+	if len(tags) != 1 {
+		t.Errorf("got %d tags, want 1", len(tags))
+	}
+	if calls != 1 {
+		t.Errorf("server called %d times, want 1 (single page should stop)", calls)
+	}
+}
+
 // TestDoRequest_RetryOn429 verifies that doRequest retries once on 429 and succeeds.
 func TestDoRequest_RetryOn429(t *testing.T) {
 	calls := 0
