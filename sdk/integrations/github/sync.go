@@ -16,7 +16,19 @@ var _ core.SyncCapable = (*SyncClient)(nil)
 
 // issuesSyncPerPage is the page size used by SyncClient's exhaustive issue
 // listing, matching the #86 pagination pattern used elsewhere in this package.
+// ListUpdatedSince/ListAll follow this cursor to exhaustion with no page cap
+// (unlike the host-facing ListIssues/ListReleases/ListTags, which impose a
+// safety cap) — bounding the number of pages fetched per sync pass is the
+// host's responsibility, since the shadow-diff engine already tracks a
+// resumable cursor across calls.
 const issuesSyncPerPage = 100
+
+// commentScanPerPage is the page size used by SyncClient.AddComment's
+// idempotency scan. It deliberately does not reuse Client.ListIssueComments,
+// which is documented single-page (GitHub's default 30 comments) — a
+// pilot-op marker posted beyond the first 30 comments would be invisible to
+// a retry, causing a duplicate repost.
+const commentScanPerPage = 100
 
 // pilotOpMarkerFormat renders the idempotency marker embedded in comment
 // bodies posted via SyncClient.AddComment. A retried sync scans existing
@@ -39,15 +51,20 @@ func NewSyncClient(client *Client, owner, repo string) *SyncClient {
 }
 
 // resolveRepo returns the owner/repo to query for a projectID. projectID is
-// expected in "owner/repo" form (matching Config.Repo); if empty or
-// malformed, the SyncClient's bound owner/repo is used instead.
-func (s *SyncClient) resolveRepo(projectID string) (owner, repo string) {
-	if projectID != "" {
-		if parts := strings.SplitN(projectID, "/", 2); len(parts) == 2 {
-			return parts[0], parts[1]
-		}
+// expected in "owner/repo" form (matching Config.Repo); an empty projectID
+// resolves to the SyncClient's bound owner/repo. A non-empty projectID that
+// isn't valid "owner/repo" form is rejected with an error rather than
+// silently falling back to the bound repo — a malformed override should
+// never be mistaken for "use the default".
+func (s *SyncClient) resolveRepo(projectID string) (owner, repo string, err error) {
+	if projectID == "" {
+		return s.owner, s.repo, nil
 	}
-	return s.owner, s.repo
+	parts := strings.SplitN(projectID, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid projectID %q: expected \"owner/repo\"", projectID)
+	}
+	return parts[0], parts[1], nil
 }
 
 // parseCursor decodes a core.Cursor into a 1-based page number. An empty
@@ -63,19 +80,46 @@ func parseCursor(page core.Cursor) (int, error) {
 	return n, nil
 }
 
-// parseNativeID decodes an IssueSnapshot.NativeID into a GitHub issue number.
-func parseNativeID(nativeID string) (int, error) {
+// parseNativeID decodes an IssueSnapshot.NativeID into the owner/repo/number
+// it refers to. Two forms are accepted:
+//   - a bare decimal number ("42"), which resolves to the SyncClient's bound
+//     repo — the common case, and the format toSnapshot emits when a
+//     snapshot was produced for the bound repo.
+//   - "owner/repo#number" (e.g. "other-owner/other-repo#42"), which
+//     toSnapshot emits when a snapshot was produced via a projectID override
+//     (see resolveRepo) that resolved to a repo other than the bound one.
+//
+// This is what lets GetIssue/UpdateFields/TransitionState/AddComment — whose
+// core.SyncWriter/SyncSource signatures carry only a nativeID, not a
+// projectID — route a write-back to the same repo a listing call actually
+// read the issue from, instead of silently hitting the bound repo's
+// same-numbered issue.
+func (s *SyncClient) parseNativeID(nativeID string) (owner, repo string, number int, err error) {
+	if idx := strings.LastIndex(nativeID, "#"); idx != -1 {
+		repoPart, numPart := nativeID[:idx], nativeID[idx+1:]
+		parts := strings.SplitN(repoPart, "/", 2)
+		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+			return "", "", 0, fmt.Errorf("invalid nativeID %q: malformed repo prefix", nativeID)
+		}
+		n, err := strconv.Atoi(numPart)
+		if err != nil {
+			return "", "", 0, fmt.Errorf("invalid nativeID %q: %w", nativeID, err)
+		}
+		return parts[0], parts[1], n, nil
+	}
 	n, err := strconv.Atoi(nativeID)
 	if err != nil {
-		return 0, fmt.Errorf("invalid nativeID %q: %w", nativeID, err)
+		return "", "", 0, fmt.Errorf("invalid nativeID %q: %w", nativeID, err)
 	}
-	return n, nil
+	return s.owner, s.repo, n, nil
 }
 
-// toSnapshot maps a GitHub Issue onto the normalized core.IssueSnapshot.
-// StateGroup mirrors State (open/closed) since GitHub issues have no
-// separate state-category concept.
-func (s *SyncClient) toSnapshot(issue *Issue) core.IssueSnapshot {
+// toSnapshot maps a GitHub Issue fetched from owner/repo onto the normalized
+// core.IssueSnapshot. StateGroup mirrors State (open/closed) since GitHub
+// issues have no separate state-category concept. NativeID is a bare issue
+// number when owner/repo is the SyncClient's bound repo, or "owner/repo#N"
+// when it was fetched via a projectID override — see parseNativeID.
+func (s *SyncClient) toSnapshot(owner, repo string, issue *Issue) core.IssueSnapshot {
 	labels := make([]string, 0, len(issue.Labels))
 	for _, l := range issue.Labels {
 		labels = append(labels, l.Name)
@@ -84,8 +128,12 @@ func (s *SyncClient) toSnapshot(issue *Issue) core.IssueSnapshot {
 	if issue.Assignee != nil {
 		assignee = issue.Assignee.Login
 	}
+	nativeID := strconv.Itoa(issue.Number)
+	if owner != s.owner || repo != s.repo {
+		nativeID = fmt.Sprintf("%s/%s#%d", owner, repo, issue.Number)
+	}
 	return core.IssueSnapshot{
-		NativeID:   strconv.Itoa(issue.Number),
+		NativeID:   nativeID,
 		SequenceID: "GH-" + strconv.Itoa(issue.Number),
 		Title:      issue.Title,
 		Body:       issue.Body,
@@ -113,7 +161,10 @@ func (s *SyncClient) listIssuesPage(ctx context.Context, owner, repo string, sin
 		fmt.Sprintf("page=%d", pageNum),
 	}
 	if !since.IsZero() {
-		params = append(params, "since="+since.Format(time.RFC3339))
+		// UTC before formatting: a non-UTC offset (e.g. "+02:00") embeds a
+		// literal "+" in the query string, which decodes as a space and
+		// corrupts the since filter server-side.
+		params = append(params, "since="+since.UTC().Format(time.RFC3339))
 	}
 	path := fmt.Sprintf("/repos/%s/%s/issues?%s", owner, repo, strings.Join(params, "&"))
 
@@ -128,7 +179,10 @@ func (s *SyncClient) listIssuesPage(ctx context.Context, owner, repo string, sin
 // both are exhaustive, cursor-paginated issue listings that differ only in
 // whether a since filter is applied.
 func (s *SyncClient) listPage(ctx context.Context, projectID string, since time.Time, page core.Cursor) ([]core.IssueSnapshot, core.Cursor, error) {
-	owner, repo := s.resolveRepo(projectID)
+	owner, repo, err := s.resolveRepo(projectID)
+	if err != nil {
+		return nil, "", err
+	}
 	pageNum, err := parseCursor(page)
 	if err != nil {
 		return nil, "", err
@@ -144,7 +198,7 @@ func (s *SyncClient) listPage(ctx context.Context, projectID string, since time.
 		if issue.PullRequest != nil {
 			continue // GitHub's /issues endpoint returns PRs too; exclude them.
 		}
-		snapshots = append(snapshots, s.toSnapshot(issue))
+		snapshots = append(snapshots, s.toSnapshot(owner, repo, issue))
 	}
 
 	next := core.Cursor("")
@@ -165,20 +219,21 @@ func (s *SyncClient) ListAll(ctx context.Context, projectID string, page core.Cu
 	return s.listPage(ctx, projectID, time.Time{}, page)
 }
 
-// GetIssue fetches a single issue by its number (as a decimal string).
+// GetIssue fetches a single issue by nativeID (see parseNativeID for the
+// accepted forms).
 func (s *SyncClient) GetIssue(ctx context.Context, nativeID string) (core.IssueSnapshot, error) {
-	number, err := parseNativeID(nativeID)
+	owner, repo, number, err := s.parseNativeID(nativeID)
 	if err != nil {
 		return core.IssueSnapshot{}, err
 	}
-	issue, err := s.client.GetIssue(ctx, s.owner, s.repo, number)
+	issue, err := s.client.GetIssue(ctx, owner, repo, number)
 	if err != nil {
 		return core.IssueSnapshot{}, err
 	}
 	if issue.PullRequest != nil {
 		return core.IssueSnapshot{}, fmt.Errorf("nativeID %s is a pull request, not an issue", nativeID)
 	}
-	return s.toSnapshot(issue), nil
+	return s.toSnapshot(owner, repo, issue), nil
 }
 
 // buildIssuePatch converts a core.FieldPatch into the PATCH body accepted by
@@ -212,7 +267,7 @@ func buildIssuePatch(fields core.FieldPatch) (map[string]interface{}, error) {
 
 // UpdateFields applies a partial patch (title/body/labels) to nativeID.
 func (s *SyncClient) UpdateFields(ctx context.Context, nativeID string, fields core.FieldPatch) (core.IssueSnapshot, error) {
-	number, err := parseNativeID(nativeID)
+	owner, repo, number, err := s.parseNativeID(nativeID)
 	if err != nil {
 		return core.IssueSnapshot{}, err
 	}
@@ -221,52 +276,76 @@ func (s *SyncClient) UpdateFields(ctx context.Context, nativeID string, fields c
 		return core.IssueSnapshot{}, err
 	}
 
-	path := fmt.Sprintf("/repos/%s/%s/issues/%d", s.owner, s.repo, number)
+	path := fmt.Sprintf("/repos/%s/%s/issues/%d", owner, repo, number)
 	var issue Issue
 	if err := s.client.doRequest(ctx, http.MethodPatch, path, patch, &issue); err != nil {
 		return core.IssueSnapshot{}, err
 	}
-	return s.toSnapshot(&issue), nil
+	return s.toSnapshot(owner, repo, &issue), nil
 }
 
 // TransitionState moves nativeID to providerState ("open" or "closed").
 func (s *SyncClient) TransitionState(ctx context.Context, nativeID, providerState string) error {
-	number, err := parseNativeID(nativeID)
+	owner, repo, number, err := s.parseNativeID(nativeID)
 	if err != nil {
 		return err
 	}
-	return s.client.UpdateIssueState(ctx, s.owner, s.repo, number, providerState)
+	return s.client.UpdateIssueState(ctx, owner, repo, number, providerState)
+}
+
+// hasCommentMarker scans nativeID's comments for marker, paginating
+// exhaustively (commentScanPerPage per page, no cap) rather than relying on
+// Client.ListIssueComments' documented single default-sized page — a marker
+// posted beyond the first page would otherwise be invisible to a retry,
+// causing AddComment to double-post.
+func (s *SyncClient) hasCommentMarker(ctx context.Context, owner, repo string, number int, marker string) (bool, error) {
+	for page := 1; ; page++ {
+		path := fmt.Sprintf("/repos/%s/%s/issues/%d/comments?per_page=%d&page=%d", owner, repo, number, commentScanPerPage, page)
+		var batch []*Comment
+		if err := s.client.doRequest(ctx, http.MethodGet, path, nil, &batch); err != nil {
+			return false, err
+		}
+		for _, c := range batch {
+			if strings.Contains(c.Body, marker) {
+				return true, nil
+			}
+		}
+		if len(batch) < commentScanPerPage {
+			return false, nil
+		}
+	}
 }
 
 // AddComment posts body as a comment on nativeID, embedding an idempotency
 // marker derived from idemKey. Before posting, it scans existing comments
 // for the marker; if found, it does not repost (safe retry).
 func (s *SyncClient) AddComment(ctx context.Context, nativeID, body, idemKey string) error {
-	number, err := parseNativeID(nativeID)
+	owner, repo, number, err := s.parseNativeID(nativeID)
 	if err != nil {
 		return err
 	}
 
 	marker := fmt.Sprintf(pilotOpMarkerFormat, idemKey)
 
-	existing, err := s.client.ListIssueComments(ctx, s.owner, s.repo, number)
+	found, err := s.hasCommentMarker(ctx, owner, repo, number, marker)
 	if err != nil {
 		return err
 	}
-	for _, c := range existing {
-		if strings.Contains(c.Body, marker) {
-			return nil // Already posted; retry is a no-op.
-		}
+	if found {
+		return nil // Already posted; retry is a no-op.
 	}
 
 	fullBody := body + "\n\n" + marker
-	_, err = s.client.AddComment(ctx, s.owner, s.repo, number, fullBody)
+	_, err = s.client.AddComment(ctx, owner, repo, number, fullBody)
 	return err
 }
 
 // CreateIssue creates a new issue in projectID from draft.
 func (s *SyncClient) CreateIssue(ctx context.Context, projectID string, draft core.IssueDraft) (core.IssueSnapshot, error) {
-	owner, repo := s.resolveRepo(projectID)
+	owner, repo, err := s.resolveRepo(projectID)
+	if err != nil {
+		return core.IssueSnapshot{}, err
+	}
 	input := &IssueInput{
 		Title:  draft.Title,
 		Body:   draft.Body,
@@ -276,5 +355,5 @@ func (s *SyncClient) CreateIssue(ctx context.Context, projectID string, draft co
 	if err != nil {
 		return core.IssueSnapshot{}, err
 	}
-	return s.toSnapshot(issue), nil
+	return s.toSnapshot(owner, repo, issue), nil
 }

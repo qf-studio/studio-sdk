@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -399,5 +400,148 @@ func TestSyncClient_CreateIssue_ProjectIDOverridesBoundRepo(t *testing.T) {
 
 	if _, err := client.CreateIssue(context.Background(), "other-owner/other-repo", core.IssueDraft{Title: "x"}); err != nil {
 		t.Fatalf("CreateIssue() error = %v", err)
+	}
+}
+
+// TestSyncClient_AddComment_MultiPageIdempotencyScan verifies the idempotency
+// scan paginates past the first page: a marker sitting on page 2 (behind
+// commentScanPerPage comments on page 1) must still be found, so a retry
+// does not double-post.
+func TestSyncClient_AddComment_MultiPageIdempotencyScan(t *testing.T) {
+	page1 := make([]*Comment, commentScanPerPage)
+	for i := range page1 {
+		page1[i] = &Comment{ID: int64(i + 1), Body: fmt.Sprintf("comment %d", i+1)}
+	}
+	page2 := []*Comment{
+		{ID: 1000, Body: "synced\n\n<!-- pilot-op:key-999 -->"},
+	}
+
+	posts := 0
+	var gotPages []string
+	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/issues/3/comments":
+			q := r.URL.Query()
+			gotPages = append(gotPages, q.Get("page"))
+			if q.Get("per_page") != strconv.Itoa(commentScanPerPage) {
+				t.Errorf("per_page = %q, want %d", q.Get("per_page"), commentScanPerPage)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			if q.Get("page") == "2" {
+				_ = json.NewEncoder(w).Encode(page2)
+			} else {
+				_ = json.NewEncoder(w).Encode(page1)
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/repos/owner/repo/issues/3/comments":
+			posts++
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(&Comment{ID: 2000})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	if err := client.AddComment(context.Background(), "3", "synced", "key-999"); err != nil {
+		t.Fatalf("AddComment() error = %v", err)
+	}
+	if posts != 0 {
+		t.Errorf("posts = %d, want 0 (marker found on page 2, beyond a single default-sized page)", posts)
+	}
+	if len(gotPages) != 2 {
+		t.Fatalf("expected the scan to fetch 2 pages, got %d (%v)", len(gotPages), gotPages)
+	}
+}
+
+// TestSyncClient_CrossRepoNativeID_RoutesWriteToCorrectRepo is the write-scope
+// regression test: listing a non-bound projectID must produce a NativeID that
+// routes a subsequent write-back to the SAME repo the issue was listed from,
+// not the bound repo's same-numbered issue.
+func TestSyncClient_CrossRepoNativeID_RoutesWriteToCorrectRepo(t *testing.T) {
+	var gotPatchPath string
+	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repos/other-owner/other-repo/issues":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode([]*Issue{{Number: 7, Title: "cross-repo issue"}})
+		case r.Method == http.MethodPatch:
+			gotPatchPath = r.URL.Path
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(&Issue{Number: 7, Title: "updated"})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	snaps, _, err := client.ListAll(context.Background(), "other-owner/other-repo", "")
+	if err != nil {
+		t.Fatalf("ListAll() error = %v", err)
+	}
+	if len(snaps) != 1 {
+		t.Fatalf("got %d snapshots, want 1", len(snaps))
+	}
+	if snaps[0].NativeID != "other-owner/other-repo#7" {
+		t.Fatalf("NativeID = %q, want %q (repo-qualified, since it differs from the bound repo)", snaps[0].NativeID, "other-owner/other-repo#7")
+	}
+
+	if _, err := client.UpdateFields(context.Background(), snaps[0].NativeID, core.FieldPatch{"title": "updated"}); err != nil {
+		t.Fatalf("UpdateFields() error = %v", err)
+	}
+	if gotPatchPath != "/repos/other-owner/other-repo/issues/7" {
+		t.Errorf("PATCH path = %q, want /repos/other-owner/other-repo/issues/7 (not a silent write to the bound repo's #7)", gotPatchPath)
+	}
+}
+
+// TestSyncClient_MalformedProjectID_Errors verifies a malformed projectID
+// override is rejected loudly rather than silently falling back to the bound
+// repo (which would look identical to a caller that meant to target a
+// different repo).
+func TestSyncClient_MalformedProjectID_Errors(t *testing.T) {
+	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("API should not be called for a malformed projectID")
+	})
+
+	if _, _, err := client.ListAll(context.Background(), "not-a-repo-slug", ""); err == nil {
+		t.Fatal("ListAll(): expected error for malformed projectID")
+	}
+	if _, _, err := client.ListUpdatedSince(context.Background(), "not-a-repo-slug", time.Time{}, ""); err == nil {
+		t.Fatal("ListUpdatedSince(): expected error for malformed projectID")
+	}
+	if _, err := client.CreateIssue(context.Background(), "not-a-repo-slug", core.IssueDraft{Title: "x"}); err == nil {
+		t.Fatal("CreateIssue(): expected error for malformed projectID")
+	}
+	if _, err := client.CreateIssue(context.Background(), "/missing-owner", core.IssueDraft{Title: "x"}); err == nil {
+		t.Fatal("CreateIssue(): expected error for projectID with an empty owner segment")
+	}
+}
+
+// TestSyncClient_ListUpdatedSince_SinceSerializedInUTC verifies since is
+// normalized to UTC before formatting: a non-UTC offset like "+02:00" embeds
+// a literal "+" in the query string, which decodes as a space server-side and
+// corrupts the filter.
+func TestSyncClient_ListUpdatedSince_SinceSerializedInUTC(t *testing.T) {
+	var gotSince string
+	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotSince = r.URL.Query().Get("since")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode([]*Issue{})
+	})
+
+	loc := time.FixedZone("CEST", 2*60*60)
+	since := time.Date(2026, 1, 1, 10, 0, 0, 0, loc)
+
+	if _, _, err := client.ListUpdatedSince(context.Background(), "", since, ""); err != nil {
+		t.Fatalf("ListUpdatedSince() error = %v", err)
+	}
+	want := since.UTC().Format(time.RFC3339)
+	if gotSince != want {
+		t.Errorf("since = %q, want %q (UTC)", gotSince, want)
+	}
+	if strings.Contains(gotSince, " ") {
+		t.Errorf("since = %q contains a space — a non-UTC offset's %q was decoded as a space", gotSince, "+")
 	}
 }
