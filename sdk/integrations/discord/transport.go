@@ -186,8 +186,16 @@ func (g *GatewayClient) listen(ctx context.Context) <-chan GatewayEvent {
 			default:
 			}
 
+			g.mu.Lock()
+			c := g.conn
+			g.mu.Unlock()
+			if c == nil {
+				g.log.Warn("discord: listen: connection is nil, ending read loop")
+				return
+			}
+
 			var event GatewayEvent
-			if err := g.conn.ReadJSON(&event); err != nil {
+			if err := c.ReadJSON(&event); err != nil {
 				code := extractCloseCode(err)
 				if code != 0 {
 					if isFatalCloseCode(code) {
