@@ -434,6 +434,7 @@ func (p *Poller) startSequential(ctx context.Context) {
 				slog.Int("number", issue.Number),
 				slog.Any("error", err),
 			)
+			p.syncBoardStatusRetry(ctx, issue)
 			continue
 		}
 
@@ -516,6 +517,7 @@ func (p *Poller) startSequential(ctx context.Context) {
 			p.logger.Info("Execution failed without PR, not marking as processed (retryable)",
 				slog.Int("issue_number", issue.Number),
 			)
+			p.syncBoardStatusRetry(ctx, issue)
 			continue
 		}
 
@@ -549,7 +551,31 @@ func (p *Poller) fetchCandidates(ctx context.Context) ([]*Issue, error) {
 // Logs errors but does not fail the dispatch — board sync is best-effort.
 // No-op when boardSync is nil or inProgressStatus is empty.
 func (p *Poller) syncBoardStatusInProgress(ctx context.Context, issue *Issue) {
-	if p.boardSync == nil || p.inProgressStatus == "" {
+	p.syncBoardStatus(ctx, issue, p.inProgressStatus)
+}
+
+// syncBoardStatusRetry moves the issue card back to the board's source column after a
+// confirmed dispatch fails before producing a PR (execution error, or an unsuccessful
+// run with no PR). fetchCandidates only ever reads the source column, so without this
+// revert a card left in the in-progress column by syncBoardStatusInProgress becomes
+// permanently invisible to the poller — the source can never re-pick it (GH-4474).
+// No-op when board sourcing isn't active (label-mode dispatch has no card to revert).
+func (p *Poller) syncBoardStatusRetry(ctx context.Context, issue *Issue) {
+	if p.projectBoardSource == nil {
+		return
+	}
+	status := p.projectBoardSource.config.SourceStatus
+	if status == "" {
+		status = "Todo" // same default as fetchCandidates
+	}
+	p.syncBoardStatus(ctx, issue, status)
+}
+
+// syncBoardStatus moves the issue card to the named status column on the Projects V2
+// board. Logs errors but never fails the caller — board sync is best-effort. No-op
+// when boardSync is nil or status is empty.
+func (p *Poller) syncBoardStatus(ctx context.Context, issue *Issue, status string) {
+	if p.boardSync == nil || status == "" {
 		return
 	}
 
@@ -565,10 +591,10 @@ func (p *Poller) syncBoardStatusInProgress(ctx context.Context, issue *Issue) {
 		}
 	}
 
-	if err := p.boardSync.UpdateProjectItemStatus(ctx, nodeID, p.inProgressStatus); err != nil {
+	if err := p.boardSync.UpdateProjectItemStatus(ctx, nodeID, status); err != nil {
 		p.logger.Warn("board sync: failed to update project item status",
 			slog.Int("issue", issue.Number),
-			slog.String("status", p.inProgressStatus),
+			slog.String("status", status),
 			slog.Any("error", err))
 	}
 }
@@ -1005,6 +1031,7 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 						slog.Any("error", err),
 					)
 					p.unmarkProcessed(issue.Number)
+					p.syncBoardStatusRetry(ctx, issue)
 					return
 				}
 
@@ -1013,6 +1040,7 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 						slog.Int("number", issue.Number),
 					)
 					p.unmarkProcessed(issue.Number)
+					p.syncBoardStatusRetry(ctx, issue)
 				}
 
 				if result != nil && result.PRNumber > 0 && p.OnPRCreated != nil {
@@ -1034,6 +1062,7 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 						slog.Any("error", err),
 					)
 					p.unmarkProcessed(issue.Number)
+					p.syncBoardStatusRetry(ctx, issue)
 				}
 			}
 		}(issue)
