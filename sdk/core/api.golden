@@ -191,6 +191,15 @@ type PollerDeps struct {
 	IssueMetricsRecorder IssueMetricsRecorder
 	RateLimitScheduler RateLimitScheduler
 	Logger *slog.Logger
+	PollerMetrics PollerMetricsRecorder
+	BoardSyncAuthAlert func(error)
+}
+
+type PollerMetricsRecorder interface {
+	RecordPollerSkipped(repo, reason string)
+	RecordPollerDispatched(repo string)
+	RecordPollerDeferredScopeOverlap(repo string)
+	RecordUnsourcedLabeledIssues(repo string, count int)
 }
 
 type PreFlightJudger interface {

@@ -130,6 +130,12 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	if deps.Logger != nil {
 		opts = append(opts, WithPollerLogger(deps.Logger))
 	}
+	if deps.PollerMetrics != nil {
+		opts = append(opts, WithPollerMetrics(deps.PollerMetrics))
+	}
+	if deps.BoardSyncAuthAlert != nil {
+		opts = append(opts, WithBoardSyncAuthAlert(deps.BoardSyncAuthAlert))
+	}
 
 	// Board layer is config-driven, not a PollerDeps hook: construct the board
 	// source/sync from ProjectBoardConfig so hosts get board mode by config alone.
