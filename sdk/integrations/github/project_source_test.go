@@ -673,3 +673,75 @@ func TestFetchCandidates_DefaultsSourceStatusToTodo(t *testing.T) {
 		t.Errorf("expected only issue #1 (Todo column), got %v", issues)
 	}
 }
+
+// TestBoardStatusByIssue covers the board-wide status scan used by GH-4488's
+// unsourced-labeled-issue detection: unlike FindIssuesFromProject it is not
+// filtered to a single status column, so callers can tell "on the board in
+// the wrong column" apart from "absent from the board entirely".
+func TestBoardStatusByIssue(t *testing.T) {
+	server := fakeProjectSourceServer(t, []string{
+		orgProjectResp("PVT_allstatus"),
+		itemsResp([]map[string]interface{}{
+			issueNode(1, "I_1", "In Todo", "", "OPEN", "org/repo", "Todo"),
+			issueNode(2, "I_2", "In Progress", "", "OPEN", "org/repo", "In Progress"),
+			issueNode(3, "I_3", "Closed", "", "CLOSED", "org/repo", "Done"),
+			issueNode(4, "I_4", "Other repo", "", "OPEN", "org/other-repo", "Todo"),
+		}, false, ""),
+	})
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	src := NewProjectBoardSource(client, &ProjectBoardConfig{
+		ProjectNumber: 1,
+		StatusField:   "Status",
+	}, "org", "repo")
+
+	statuses, err := src.BoardStatusByIssue(context.Background())
+	if err != nil {
+		t.Fatalf("BoardStatusByIssue() error = %v", err)
+	}
+
+	want := map[int]string{1: "Todo", 2: "In Progress"}
+	if len(statuses) != len(want) {
+		t.Fatalf("statuses = %v, want %v", statuses, want)
+	}
+	for num, status := range want {
+		if statuses[num] != status {
+			t.Errorf("statuses[%d] = %q, want %q", num, statuses[num], status)
+		}
+	}
+	if _, ok := statuses[3]; ok {
+		t.Errorf("expected closed issue #3 to be excluded, got status %q", statuses[3])
+	}
+	if _, ok := statuses[4]; ok {
+		t.Errorf("expected cross-repo issue #4 to be excluded, got status %q", statuses[4])
+	}
+}
+
+// TestBoardStatusByIssue_Pagination verifies the cursor loop accumulates
+// statuses across pages, mirroring FindIssuesFromProject's pagination test.
+func TestBoardStatusByIssue_Pagination(t *testing.T) {
+	page1Node := issueNode(1, "I_1", "Issue 1", "", "OPEN", "org/repo", "Todo")
+	page2Node := issueNode(2, "I_2", "Issue 2", "", "OPEN", "org/repo", "In Progress")
+
+	server := fakeProjectSourceServer(t, []string{
+		orgProjectResp("PVT_paged"),
+		itemsResp([]map[string]interface{}{page1Node}, true, "cursor-abc"),
+		itemsResp([]map[string]interface{}{page2Node}, false, ""),
+	})
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	src := NewProjectBoardSource(client, &ProjectBoardConfig{
+		ProjectNumber: 2,
+		StatusField:   "Status",
+	}, "org", "repo")
+
+	statuses, err := src.BoardStatusByIssue(context.Background())
+	if err != nil {
+		t.Fatalf("BoardStatusByIssue() error = %v", err)
+	}
+	if statuses[1] != "Todo" || statuses[2] != "In Progress" {
+		t.Errorf("statuses = %v, want map[1:Todo 2:In Progress]", statuses)
+	}
+}

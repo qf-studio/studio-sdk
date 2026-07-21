@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -91,6 +92,20 @@ type Poller struct {
 	// nil or empty inProgressStatus disables the write-back, keeping label-mode identical.
 	boardSync        *ProjectBoardSync
 	inProgressStatus string
+
+	// onBoardSyncAuthError is called at most once per process lifetime (guarded by
+	// boardSyncAlertOnce) when a board-sync call fails with an INSUFFICIENT_SCOPES
+	// GraphQL error or a 401 AuthError, instead of the per-item WARN spam that
+	// otherwise leaves an under-scoped token's cards silently stale (GH-4488).
+	onBoardSyncAuthError func(error)
+	boardSyncAlertOnce   sync.Once
+
+	// unsourcedWarned tracks, by issue number, which open dispatch-labeled issues
+	// are currently WARN-logged as not board-sourced. Cleared/rebuilt each check so
+	// the WARN fires once per poll-session per issue (not once per tick) and clears
+	// automatically once the issue is sourced correctly (GH-4488).
+	unsourcedWarned map[int]bool
+	unsourcedMu     sync.Mutex
 
 	// Host-supplied execution-pipeline hooks (core.PollerDeps parity). All nil-safe:
 	// a nil hook disables the corresponding gate, preserving pre-hook behavior.
@@ -200,6 +215,14 @@ func WithBoardSync(bs *ProjectBoardSync, inProgressStatus string) PollerOption {
 		p.boardSync = bs
 		p.inProgressStatus = inProgressStatus
 	}
+}
+
+// WithBoardSyncAuthAlert sets a hook called once per process lifetime when board
+// sync fails with an auth/scope-class error (INSUFFICIENT_SCOPES GraphQL error,
+// or a 401 AuthError) — instead of the per-item WARN spam that otherwise leaves an
+// under-scoped token's board cards silently stale. No-op when fn is nil.
+func WithBoardSyncAuthAlert(fn func(error)) PollerOption {
+	return func(p *Poller) { p.onBoardSyncAuthError = fn }
 }
 
 // WithTaskChecker sets the checker consulted during retry-grace evaluation so
@@ -363,6 +386,7 @@ func (p *Poller) startParallel(ctx context.Context) {
 	)
 
 	p.checkForNewIssues(ctx)
+	p.checkUnsourcedLabeledIssues(ctx)
 
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -379,6 +403,7 @@ func (p *Poller) startParallel(ctx context.Context) {
 			return
 		case <-ticker.C:
 			p.checkForNewIssues(ctx)
+			p.checkUnsourcedLabeledIssues(ctx)
 		}
 	}
 }
@@ -546,6 +571,75 @@ func (p *Poller) fetchCandidates(ctx context.Context) ([]*Issue, error) {
 	})
 }
 
+// checkUnsourcedLabeledIssues detects open, dispatch-labeled issues that a
+// configured board source will never surface to fetchCandidates — because
+// they're absent from the board, or on the board in a status other than
+// source_status. Without this, the poller looks identical to the operator
+// whether it's healthy-with-an-empty-Todo-column or has silently stopped
+// seeing real work (GH-4488). No-op when board sourcing isn't active.
+//
+// WARNs once per issue per poll-session (the internal unsourcedWarned set is
+// rebuilt on every call, so a resolved issue drops out and the WARN clears;
+// a still-unresolved issue is not re-logged on the next call) and keeps the
+// pilot_poller_unsourced_labeled_issues gauge (via pollerMetrics) in sync.
+//
+// Deliberately NOT called from checkForNewIssues/findOldestUnprocessedIssue:
+// those are the hot dispatch path and unit-tested against fixed fake-server
+// routes (issues-list / single-issue GET). This runs on its own cadence from
+// startParallel so it can freely add a labeled-issue list call plus a
+// board-wide status scan without touching the dispatch loop's request shape.
+func (p *Poller) checkUnsourcedLabeledIssues(ctx context.Context) {
+	if p.projectBoardSource == nil {
+		return
+	}
+
+	labeled, err := p.client.ListIssues(ctx, p.owner, p.repo, &ListIssuesOptions{
+		Labels: []string{p.label},
+		State:  StateOpen,
+	})
+	if err != nil {
+		p.logger.Warn("unsourced-check: failed to list labeled issues", slog.Any("error", err))
+		return
+	}
+
+	statuses, err := p.projectBoardSource.BoardStatusByIssue(ctx)
+	if err != nil {
+		p.logger.Warn("unsourced-check: failed to read board statuses", slog.Any("error", err))
+		return
+	}
+
+	sourceStatus := p.projectBoardSource.config.SourceStatus
+	if sourceStatus == "" {
+		sourceStatus = "Todo"
+	}
+
+	p.unsourcedMu.Lock()
+	defer p.unsourcedMu.Unlock()
+
+	stillUnsourced := make(map[int]bool)
+	for _, issue := range labeled {
+		status, onBoard := statuses[issue.Number]
+		if onBoard && strings.EqualFold(status, sourceStatus) {
+			continue // sourced correctly — nothing to warn about
+		}
+		stillUnsourced[issue.Number] = true
+		if !p.unsourcedWarned[issue.Number] {
+			p.logger.Warn("labeled issue not board-sourced — add to board status or remove label",
+				slog.Int("number", issue.Number),
+				slog.String("label", p.label),
+				slog.String("source_status", sourceStatus),
+				slog.Bool("on_board", onBoard),
+				slog.String("board_status", status),
+			)
+		}
+	}
+	p.unsourcedWarned = stillUnsourced
+
+	if p.pollerMetrics != nil {
+		p.pollerMetrics.RecordUnsourcedLabeledIssues(p.repoKey(), len(stillUnsourced))
+	}
+}
+
 // syncBoardStatusInProgress moves the issue card to the configured in-progress status
 // on the Projects V2 board. Called once after confirmed dispatch, before execution starts.
 // Logs errors but does not fail the dispatch — board sync is best-effort.
@@ -587,6 +681,7 @@ func (p *Poller) syncBoardStatus(ctx context.Context, issue *Issue, status strin
 			p.logger.Warn("board sync: failed to resolve issue node ID",
 				slog.Int("issue", issue.Number),
 				slog.Any("error", err))
+			p.alertBoardSyncAuthError(err)
 			return
 		}
 	}
@@ -596,7 +691,43 @@ func (p *Poller) syncBoardStatus(ctx context.Context, issue *Issue, status strin
 			slog.Int("issue", issue.Number),
 			slog.String("status", status),
 			slog.Any("error", err))
+		p.alertBoardSyncAuthError(err)
 	}
+}
+
+// classifyBoardSyncAuthError inspects a board-sync error for an auth/scope-class
+// failure — an INSUFFICIENT_SCOPES GraphQL error type, or a 401 AuthError from
+// the REST node-ID lookup — and returns its detail message. ok is false for
+// unrelated errors (network blips, rate limits, missing card, etc.), which stay
+// WARN-only rather than paging anyone.
+func classifyBoardSyncAuthError(err error) (detail string, ok bool) {
+	if err == nil {
+		return "", false
+	}
+	var authErr *AuthError
+	if errors.As(err, &authErr) {
+		return authErr.Message, true
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "INSUFFICIENT_SCOPES") {
+		return "", false
+	}
+	return msg, true
+}
+
+// alertBoardSyncAuthError fires the host-supplied onBoardSyncAuthError hook the
+// first time a board-sync call fails with an auth/scope-class error — once per
+// process lifetime (boardSyncAlertOnce), not once per item or per poll, so a
+// persistently under-scoped token doesn't spam an alert on every dispatch.
+// No-op for unrelated errors or when no hook is configured.
+func (p *Poller) alertBoardSyncAuthError(err error) {
+	detail, ok := classifyBoardSyncAuthError(err)
+	if !ok || p.onBoardSyncAuthError == nil {
+		return
+	}
+	p.boardSyncAlertOnce.Do(func() {
+		p.onBoardSyncAuthError(fmt.Errorf("board sync auth/scope failure: %s", detail))
+	})
 }
 
 func (p *Poller) findOldestUnprocessedIssue(ctx context.Context) (*Issue, error) {

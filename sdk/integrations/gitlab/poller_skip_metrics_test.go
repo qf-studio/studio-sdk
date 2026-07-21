@@ -38,6 +38,8 @@ func (f *fakePollerMetrics) RecordPollerDispatched(_ string) {
 
 func (f *fakePollerMetrics) RecordPollerDeferredScopeOverlap(_ string) {}
 
+func (f *fakePollerMetrics) RecordUnsourcedLabeledIssues(_ string, _ int) {}
+
 func TestGitLabPoller_SkipMetric_StatusLabel(t *testing.T) {
 	tests := []struct {
 		name           string

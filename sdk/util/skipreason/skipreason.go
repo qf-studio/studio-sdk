@@ -30,4 +30,11 @@ type PollerMetricsRecorder interface {
 	RecordPollerSkipped(repo, reason string)
 	RecordPollerDispatched(repo string)
 	RecordPollerDeferredScopeOverlap(repo string)
+
+	// RecordUnsourcedLabeledIssues sets a gauge to the current count of open,
+	// dispatch-labeled issues that a board-sourcing poller cannot see (absent
+	// from the board, or on it in a status other than source_status). Unlike
+	// the counters above this is a gauge: callers should pass the current
+	// count each time, not a delta. GH-4488.
+	RecordUnsourcedLabeledIssues(repo string, count int)
 }

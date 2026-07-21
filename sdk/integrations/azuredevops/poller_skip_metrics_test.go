@@ -38,6 +38,8 @@ func (f *fakePollerMetrics) RecordPollerDispatched(_ string) {
 
 func (f *fakePollerMetrics) RecordPollerDeferredScopeOverlap(_ string) {}
 
+func (f *fakePollerMetrics) RecordUnsourcedLabeledIssues(_ string, _ int) {}
+
 // makeAzureServer creates an httptest server returning the given work items via WIQL + batch pattern.
 func makeAzureServer(t *testing.T, workItems []*WorkItem) *httptest.Server {
 	t.Helper()
