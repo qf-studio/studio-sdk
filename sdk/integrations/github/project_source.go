@@ -182,6 +182,72 @@ func (s *ProjectBoardSource) FindIssuesFromProject(ctx context.Context, statusCo
 	return issues, nil
 }
 
+// BoardStatusByIssue returns the current board status column name for every
+// open issue on this project that belongs to owner/repo, keyed by issue
+// number. Unlike FindIssuesFromProject (filtered to a single status column),
+// this scans every column so callers can distinguish "issue absent from the
+// board entirely" from "issue on the board but sitting in a status other
+// than source_status" — both cases fetchCandidates silently never surfaces
+// (GH-4488).
+func (s *ProjectBoardSource) BoardStatusByIssue(ctx context.Context) (map[int]string, error) {
+	projectID, err := s.ensureProjectID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	statusField := s.config.StatusField
+	if statusField == "" {
+		statusField = "Status"
+	}
+
+	targetRepo := strings.ToLower(s.owner + "/" + s.repo)
+
+	statuses := make(map[int]string)
+	var cursor interface{} // nil on first page, string on subsequent pages
+
+	for {
+		vars := map[string]interface{}{
+			"projectID":   projectID,
+			"statusField": statusField,
+			"cursor":      cursor,
+		}
+
+		var resp projectBoardItemsResponse
+		if err := s.client.ExecuteGraphQLTolerant(ctx, queryProjectBoardItems, vars, &resp); err != nil {
+			var partialErr *PartialGraphQLError
+			if errors.As(err, &partialErr) {
+				slog.Warn("board page has partial errors, some nodes dropped",
+					"dropped_count", len(partialErr.Errors),
+					"errors", partialErr.Error())
+				// resp already has the good nodes from the partial response — fall through.
+			} else {
+				return nil, fmt.Errorf("list project board items: %w", err)
+			}
+		}
+
+		for _, node := range resp.Node.Items.Nodes {
+			c := node.Content
+			if c.Number == 0 {
+				continue // non-Issue item (DraftIssue, PR)
+			}
+			if strings.ToLower(c.Repository.NameWithOwner) != targetRepo {
+				continue // cross-repo filter
+			}
+			if strings.ToUpper(c.State) != "OPEN" {
+				continue // skip closed/merged issues
+			}
+			statuses[c.Number] = node.FieldValueByName.Name
+		}
+
+		if !resp.Node.Items.PageInfo.HasNextPage {
+			break
+		}
+		cursor = resp.Node.Items.PageInfo.EndCursor
+	}
+
+	return statuses, nil
+}
+
 // ensureProjectID lazily resolves and caches the project node ID.
 func (s *ProjectBoardSource) ensureProjectID(ctx context.Context) (string, error) {
 	s.mu.RLock()

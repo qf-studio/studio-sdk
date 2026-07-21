@@ -161,6 +161,19 @@ type IssueMetricsRecorder interface {
 	RecordIssueProcessed(result string)
 }
 
+// PollerMetricsRecorder records poller dispatch/skip counters and the
+// unsourced-labeled-issues gauge (GH-4488). Defined locally (rather than
+// importing sdk/util/skipreason) to keep this leaf package free of
+// dependencies on other SDK packages; any value satisfying
+// skipreason.PollerMetricsRecorder's identical method set already satisfies
+// this interface.
+type PollerMetricsRecorder interface {
+	RecordPollerSkipped(repo, reason string)
+	RecordPollerDispatched(repo string)
+	RecordPollerDeferredScopeOverlap(repo string)
+	RecordUnsourcedLabeledIssues(repo string, count int)
+}
+
 // RateLimitScheduler lets the consuming application classify a handler error
 // as a rate limit and queue the issue for a timed retry on its own scheduler.
 // QueueRetryIfRateLimited returns true when the error was recognized as a
@@ -208,6 +221,14 @@ type PollerDeps struct {
 	// Logger receives all poller-originated log lines. Nil falls back to
 	// slog.Default(), so existing consumers see no behavior change.
 	Logger *slog.Logger
+	// PollerMetrics records poller dispatch/skip counters and the
+	// unsourced-labeled-issues gauge (GH-4488).
+	PollerMetrics PollerMetricsRecorder
+	// BoardSyncAuthAlert, if set, is called at most once per process lifetime
+	// when board status-sync fails with an auth/scope-class error (GH-4488) —
+	// e.g. INSUFFICIENT_SCOPES. Adapters that have no board-sync layer ignore
+	// this field.
+	BoardSyncAuthAlert func(error)
 }
 
 // --- Registry ---

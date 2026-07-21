@@ -20,10 +20,11 @@ type fakePollerMetrics struct {
 	skipped              map[string]int
 	dispatched           int
 	deferredScopeOverlap int
+	unsourcedLabeled     map[string]int
 }
 
 func newFakePollerMetrics() *fakePollerMetrics {
-	return &fakePollerMetrics{skipped: make(map[string]int)}
+	return &fakePollerMetrics{skipped: make(map[string]int), unsourcedLabeled: make(map[string]int)}
 }
 
 func (f *fakePollerMetrics) RecordPollerSkipped(_, reason string) {
@@ -41,6 +42,12 @@ func (f *fakePollerMetrics) RecordPollerDispatched(_ string) {
 func (f *fakePollerMetrics) RecordPollerDeferredScopeOverlap(_ string) {
 	f.mu.Lock()
 	f.deferredScopeOverlap++
+	f.mu.Unlock()
+}
+
+func (f *fakePollerMetrics) RecordUnsourcedLabeledIssues(repo string, count int) {
+	f.mu.Lock()
+	f.unsourcedLabeled[repo] = count
 	f.mu.Unlock()
 }
 
