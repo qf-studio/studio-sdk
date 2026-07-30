@@ -1109,6 +1109,10 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 				p.recordSkip(skipreason.ReasonFreshLabelCheck)
 				continue
 			}
+			// Dispatch the freshly fetched issue rather than the list-snapshot —
+			// the snapshot's body/title/labels can be stale under queue depth or
+			// semaphore backpressure by the time dispatch actually happens (GH-105).
+			issue = fresh
 		} else if ferr != nil {
 			p.logger.Debug("Failed to refresh issue labels before dispatch — proceeding with snapshot",
 				slog.Int("number", issue.Number),
