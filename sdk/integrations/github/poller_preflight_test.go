@@ -117,6 +117,139 @@ func TestPoller_ParallelDispatch_CallsHandler(t *testing.T) {
 	}
 }
 
+// TestPoller_ParallelDispatch_UsesFreshIssueNotListSnapshot verifies GH-105:
+// the pre-dispatch GetIssue refresh must not be discarded. The list snapshot
+// (fetchCandidates) carries a stale body while the single-issue GET
+// (pre-dispatch refresh) returns an updated body; the handler must observe
+// the fresh body, not the stale list snapshot.
+func TestPoller_ParallelDispatch_UsesFreshIssueNotListSnapshot(t *testing.T) {
+	pilot := Label{Name: "pilot"}
+	staleIssue := &Issue{
+		Number:    42,
+		Title:     "Fix the thing",
+		Body:      "stale list-snapshot body",
+		State:     "open",
+		Labels:    []Label{pilot},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+	freshIssue := &Issue{
+		Number:    42,
+		Title:     "Fix the thing",
+		Body:      "fresh body from pre-dispatch refresh",
+		State:     "open",
+		Labels:    []Label{pilot},
+		CreatedAt: staleIssue.CreatedAt,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/issues/42"):
+			// Pre-dispatch GetIssue — must return the fresh object.
+			_, _ = w.Write(mustJSON(freshIssue))
+		default:
+			// ListIssues (fetchCandidates) — returns the stale snapshot.
+			_, _ = w.Write(mustJSON([]*Issue{staleIssue}))
+		}
+	}))
+	defer server.Close()
+
+	var handled sync.WaitGroup
+	handled.Add(1)
+	var handledIssue *Issue
+	var mu sync.Mutex
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second,
+		WithOnIssue(func(ctx context.Context, iss *Issue) error {
+			mu.Lock()
+			handledIssue = iss
+			mu.Unlock()
+			handled.Done()
+			return nil
+		}),
+		WithRetryGracePeriod(0),
+	)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	poller.checkForNewIssues(context.Background())
+	poller.WaitForActive()
+
+	mu.Lock()
+	got := handledIssue
+	mu.Unlock()
+
+	if got == nil {
+		t.Fatal("handler was never called")
+	}
+	if got.Body != freshIssue.Body {
+		t.Errorf("handler got body %q, want fresh body %q (stale snapshot leaked through dispatch)", got.Body, freshIssue.Body)
+	}
+}
+
+// TestPoller_ParallelDispatch_FailedRefresh_FallsBackToSnapshot verifies GH-105's
+// fail-open requirement: when the pre-dispatch GetIssue fails, dispatch proceeds
+// with the list-snapshot object unchanged.
+func TestPoller_ParallelDispatch_FailedRefresh_FallsBackToSnapshot(t *testing.T) {
+	pilot := Label{Name: "pilot"}
+	snapshotIssue := &Issue{
+		Number:    42,
+		Title:     "Fix the thing",
+		Body:      "snapshot body used on fail-open",
+		State:     "open",
+		Labels:    []Label{pilot},
+		CreatedAt: time.Now().Add(-1 * time.Hour),
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/issues/42"):
+			// Pre-dispatch GetIssue fails — dispatch must fall back to snapshot.
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(mustJSON([]*Issue{snapshotIssue}))
+		}
+	}))
+	defer server.Close()
+
+	var handled sync.WaitGroup
+	handled.Add(1)
+	var handledIssue *Issue
+	var mu sync.Mutex
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second,
+		WithOnIssue(func(ctx context.Context, iss *Issue) error {
+			mu.Lock()
+			handledIssue = iss
+			mu.Unlock()
+			handled.Done()
+			return nil
+		}),
+		WithRetryGracePeriod(0),
+	)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	poller.checkForNewIssues(context.Background())
+	poller.WaitForActive()
+
+	mu.Lock()
+	got := handledIssue
+	mu.Unlock()
+
+	if got == nil {
+		t.Fatal("handler was never called")
+	}
+	if got.Body != snapshotIssue.Body {
+		t.Errorf("handler got body %q, want snapshot body %q (fail-open fallback broken)", got.Body, snapshotIssue.Body)
+	}
+}
+
 func TestPoller_NewPoller_InvalidRepo(t *testing.T) {
 	_, err := NewPoller(nil, "badrepo", "pilot", 30*time.Second)
 	if err == nil {
