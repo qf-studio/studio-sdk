@@ -2535,12 +2535,16 @@ func TestExecuteGraphQL(t *testing.T) {
 			errContains: "graphql error: Field 'bad' not found",
 		},
 		{
-			name:        "http error",
-			query:       `query { viewer { login } }`,
-			statusCode:  http.StatusUnauthorized,
-			response:    `{"message":"Bad credentials"}`,
-			wantErr:     true,
-			errContains: "graphql API error (status 401)",
+			name:       "http error",
+			query:      `query { viewer { login } }`,
+			statusCode: http.StatusUnauthorized,
+			response:   `{"message":"Bad credentials"}`,
+			wantErr:    true,
+			// 401s are classified as *AuthError (matching doRequest's REST
+			// handling) so the retry/invalidation machinery can distinguish a
+			// dead token from other GraphQL errors; error text uses the same
+			// "API error (status 401)" format doRequest produces.
+			errContains: "API error (status 401)",
 		},
 		{
 			name:       "nil result ignores data",

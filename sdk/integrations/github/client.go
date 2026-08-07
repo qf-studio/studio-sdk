@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -74,15 +75,47 @@ func isTolerable(errType string) bool {
 	return errType == "NOT_FOUND" || errType == "FORBIDDEN"
 }
 
+// TokenFunc resolves the bearer token to use for a request. It is invoked
+// once per request attempt (including retries), so a rotated token — e.g. a
+// GitHub App installation token, which expires hourly — is picked up without
+// restarting the client. The context passed is the caller's request context.
+type TokenFunc func(ctx context.Context) (string, error)
+
 // Client is a GitHub API client
 type Client struct {
-	token      string
-	httpClient *http.Client
-	baseURL    string       // For testing - defaults to githubAPIURL
-	retryOpts  RetryOptions // Retry config for doRequest; overridable in tests
+	token           string    // static token set by NewClient/NewClientWithBaseURL; unused when tokenFunc is set
+	tokenFunc       TokenFunc // per-request token resolver set by NewClientWithTokenFunc; nil for static-token clients
+	invalidateToken func()    // optional hook run once on a 401 before a single fresh-resolve retry
+	httpClient      *http.Client
+	baseURL         string       // For testing - defaults to githubAPIURL
+	retryOpts       RetryOptions // Retry config for doRequest; overridable in tests
 }
 
-// NewClient creates a new GitHub client
+// ClientOption configures a Client created via NewClientWithTokenFunc.
+type ClientOption func(*Client)
+
+// WithTokenInvalidate registers a hook that runs once when a request fails
+// with 401 Unauthorized, before the client re-resolves the token via
+// TokenFunc and retries the request exactly one more time. Use it to evict a
+// cached/expired token (e.g. a GitHub App installation token invalidated
+// out-of-band) so the retry is guaranteed a fresh value rather than the same
+// stale one TokenFunc might otherwise return from its own cache.
+func WithTokenInvalidate(fn func()) ClientOption {
+	return func(c *Client) {
+		c.invalidateToken = fn
+	}
+}
+
+// WithClientBaseURL overrides the default API base URL (for testing).
+func WithClientBaseURL(baseURL string) ClientOption {
+	return func(c *Client) {
+		c.baseURL = baseURL
+	}
+}
+
+// NewClient creates a new GitHub client for a fixed, one-shot token. Suitable
+// for short-lived processes or PATs; for long-lived daemons under GitHub App
+// auth (installation tokens expire hourly) use NewClientWithTokenFunc instead.
 func NewClient(token string) *Client {
 	return &Client{
 		token:     token,
@@ -105,6 +138,59 @@ func NewClientWithBaseURL(token, baseURL string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+}
+
+// NewClientWithTokenFunc creates a GitHub client that resolves its bearer
+// token per request via fn, instead of storing a fixed token at construction.
+// This is the constructor long-lived daemons should use under GitHub App
+// auth: fn is called inside the retry loop on every attempt, so a token
+// rotated between attempts (or between requests over the client's lifetime)
+// is picked up automatically. Pair with WithTokenInvalidate to evict a
+// cached/expired token on a 401 before the single fresh-resolve retry.
+func NewClientWithTokenFunc(fn TokenFunc, opts ...ClientOption) *Client {
+	c := &Client{
+		tokenFunc: fn,
+		baseURL:   githubAPIURL,
+		retryOpts: DefaultRetryOptions(),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// resolveToken returns the token to use for the current request attempt:
+// the result of tokenFunc(ctx) when the client was built via
+// NewClientWithTokenFunc, or the fixed token from NewClient/NewClientWithBaseURL
+// otherwise.
+func (c *Client) resolveToken(ctx context.Context) (string, error) {
+	if c.tokenFunc != nil {
+		return c.tokenFunc(ctx)
+	}
+	return c.token, nil
+}
+
+// withAuthRetry runs op once. If op fails with *AuthError (401) and the
+// client has an invalidation hook configured via WithTokenInvalidate, it
+// invokes the hook and retries op exactly one more time so the retry is
+// guaranteed to re-resolve the token rather than replay the same stale value.
+// Without an invalidation hook (or for non-auth errors), op's result is
+// returned as-is — a bare 401 is not retried, matching isRetryableError's
+// "dead token, retrying cannot help" classification.
+func (c *Client) withAuthRetry(op func() error) error {
+	err := op()
+	if err == nil || c.invalidateToken == nil {
+		return err
+	}
+	var authErr *AuthError
+	if !errors.As(err, &authErr) {
+		return err
+	}
+	c.invalidateToken()
+	return op()
 }
 
 // Issue represents a GitHub issue
@@ -173,71 +259,78 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		}
 	}
 
-	return WithRetryVoid(ctx, func() error {
-		var bodyReader io.Reader
-		if bodyBytes != nil {
-			bodyReader = bytes.NewReader(bodyBytes)
-		}
-
-		req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
-		if err != nil {
-			return fmt.Errorf("failed to create request: %w", err)
-		}
-
-		req.Header.Set("Accept", "application/vnd.github+json")
-		req.Header.Set("Authorization", "Bearer "+c.token)
-		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-		if bodyBytes != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("failed to execute request: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
-
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read response: %w", err)
-		}
-
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			msg := string(respBody)
-			if resp.StatusCode == http.StatusUnauthorized {
-				return &AuthError{Message: msg}
+	return c.withAuthRetry(func() error {
+		return WithRetryVoid(ctx, func() error {
+			token, err := c.resolveToken(ctx)
+			if err != nil {
+				return fmt.Errorf("resolve token: %w", err)
 			}
-			if resp.StatusCode == http.StatusTooManyRequests {
-				return &RateLimitError{
-					StatusCode: http.StatusTooManyRequests,
-					RetryAfter: parseRetryAfterHeader(resp.Header),
-					Message:    msg,
+
+			var bodyReader io.Reader
+			if bodyBytes != nil {
+				bodyReader = bytes.NewReader(bodyBytes)
+			}
+
+			req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
+			if err != nil {
+				return fmt.Errorf("failed to create request: %w", err)
+			}
+
+			req.Header.Set("Accept", "application/vnd.github+json")
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+			if bodyBytes != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("failed to execute request: %w", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			respBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return fmt.Errorf("failed to read response: %w", err)
+			}
+
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				msg := string(respBody)
+				if resp.StatusCode == http.StatusUnauthorized {
+					return &AuthError{Message: msg}
 				}
-			}
-			if resp.StatusCode == http.StatusForbidden {
-				msgLower := strings.ToLower(msg)
-				isRateLimit := resp.Header.Get("X-RateLimit-Remaining") == "0" ||
-					strings.Contains(msgLower, "secondary rate limit") ||
-					strings.Contains(msgLower, "rate limit exceeded")
-				if isRateLimit {
+				if resp.StatusCode == http.StatusTooManyRequests {
 					return &RateLimitError{
-						StatusCode: http.StatusForbidden,
+						StatusCode: http.StatusTooManyRequests,
 						RetryAfter: parseRetryAfterHeader(resp.Header),
 						Message:    msg,
 					}
 				}
+				if resp.StatusCode == http.StatusForbidden {
+					msgLower := strings.ToLower(msg)
+					isRateLimit := resp.Header.Get("X-RateLimit-Remaining") == "0" ||
+						strings.Contains(msgLower, "secondary rate limit") ||
+						strings.Contains(msgLower, "rate limit exceeded")
+					if isRateLimit {
+						return &RateLimitError{
+							StatusCode: http.StatusForbidden,
+							RetryAfter: parseRetryAfterHeader(resp.Header),
+							Message:    msg,
+						}
+					}
+				}
+				return fmt.Errorf("API error (status %d): %s", resp.StatusCode, msg)
 			}
-			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, msg)
-		}
 
-		if result != nil && len(respBody) > 0 {
-			if err := json.Unmarshal(respBody, result); err != nil {
-				return fmt.Errorf("failed to parse response: %w", err)
+			if result != nil && len(respBody) > 0 {
+				if err := json.Unmarshal(respBody, result); err != nil {
+					return fmt.Errorf("failed to parse response: %w", err)
+				}
 			}
-		}
 
-		return nil
-	}, c.retryOpts)
+			return nil
+		}, c.retryOpts)
+	})
 }
 
 // GetIssue fetches an issue by owner, repo, and number
@@ -744,13 +837,18 @@ func (c *Client) CompareStatus(ctx context.Context, owner, repo, base, head stri
 func (c *Client) GetJobLogs(ctx context.Context, owner, repo string, jobID int64) (string, error) {
 	path := fmt.Sprintf("/repos/%s/%s/actions/jobs/%d/logs", owner, repo, jobID)
 
+	token, err := c.resolveToken(ctx)
+	if err != nil {
+		return "", fmt.Errorf("resolve token: %w", err)
+	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
 	resp, err := c.httpClient.Do(req)
@@ -929,75 +1027,85 @@ func (c *Client) executeGraphQLCore(ctx context.Context, query string, variables
 
 	endpoint := c.baseURL + "/graphql"
 
-	return WithRetryVoid(ctx, func() error {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
-		if err != nil {
-			return fmt.Errorf("create graphql request: %w", err)
-		}
-		req.Header.Set("Authorization", "Bearer "+c.token)
-		req.Header.Set("Content-Type", "application/json")
+	return c.withAuthRetry(func() error {
+		return WithRetryVoid(ctx, func() error {
+			token, err := c.resolveToken(ctx)
+			if err != nil {
+				return fmt.Errorf("resolve token: %w", err)
+			}
 
-		resp, err := c.httpClient.Do(req)
-		if err != nil {
-			return fmt.Errorf("graphql request failed: %w", err)
-		}
-		defer func() { _ = resp.Body.Close() }()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+			if err != nil {
+				return fmt.Errorf("create graphql request: %w", err)
+			}
+			req.Header.Set("Authorization", "Bearer "+token)
+			req.Header.Set("Content-Type", "application/json")
 
-		respBody, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("read graphql response: %w", err)
-		}
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				return fmt.Errorf("graphql request failed: %w", err)
+			}
+			defer func() { _ = resp.Body.Close() }()
 
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("graphql API error (status %d): %s", resp.StatusCode, string(respBody))
-		}
+			respBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return fmt.Errorf("read graphql response: %w", err)
+			}
 
-		var gqlResp GraphQLResponse
-		if err := json.Unmarshal(respBody, &gqlResp); err != nil {
-			return fmt.Errorf("parse graphql response: %w", err)
-		}
+			if resp.StatusCode == http.StatusUnauthorized {
+				return &AuthError{Message: string(respBody)}
+			}
+			if resp.StatusCode != http.StatusOK {
+				return fmt.Errorf("graphql API error (status %d): %s", resp.StatusCode, string(respBody))
+			}
 
-		if len(gqlResp.Errors) > 0 {
-			// Aggregate ALL errors (message + type + path), not just Errors[0].
-			// GitHub Projects V2 frequently returns several per-node errors at
-			// once, and surfacing only the first made board flows hard to diagnose.
-			//
-			// In tolerant mode: if all errors are NOT_FOUND/FORBIDDEN, unmarshal
-			// the good data and return *PartialGraphQLError. Any non-tolerable error
-			// (including mixed tolerable+fatal) makes the whole response fatal.
-			if tolerant {
-				allTolerable := true
-				for _, ge := range gqlResp.Errors {
-					if !isTolerable(ge.Type) {
-						allTolerable = false
-						break
-					}
-				}
-				if allTolerable {
-					if result != nil && len(gqlResp.Data) > 0 {
-						if err := json.Unmarshal(gqlResp.Data, result); err != nil {
-							return fmt.Errorf("unmarshal graphql data: %w", err)
+			var gqlResp GraphQLResponse
+			if err := json.Unmarshal(respBody, &gqlResp); err != nil {
+				return fmt.Errorf("parse graphql response: %w", err)
+			}
+
+			if len(gqlResp.Errors) > 0 {
+				// Aggregate ALL errors (message + type + path), not just Errors[0].
+				// GitHub Projects V2 frequently returns several per-node errors at
+				// once, and surfacing only the first made board flows hard to diagnose.
+				//
+				// In tolerant mode: if all errors are NOT_FOUND/FORBIDDEN, unmarshal
+				// the good data and return *PartialGraphQLError. Any non-tolerable error
+				// (including mixed tolerable+fatal) makes the whole response fatal.
+				if tolerant {
+					allTolerable := true
+					for _, ge := range gqlResp.Errors {
+						if !isTolerable(ge.Type) {
+							allTolerable = false
+							break
 						}
 					}
-					return &PartialGraphQLError{Errors: gqlResp.Errors}
+					if allTolerable {
+						if result != nil && len(gqlResp.Data) > 0 {
+							if err := json.Unmarshal(gqlResp.Data, result); err != nil {
+								return fmt.Errorf("unmarshal graphql data: %w", err)
+							}
+						}
+						return &PartialGraphQLError{Errors: gqlResp.Errors}
+					}
+				}
+
+				msgs := make([]string, len(gqlResp.Errors))
+				for i, ge := range gqlResp.Errors {
+					msgs[i] = ge.String()
+				}
+				return fmt.Errorf("graphql error: %s", strings.Join(msgs, "; "))
+			}
+
+			if result != nil && len(gqlResp.Data) > 0 {
+				if err := json.Unmarshal(gqlResp.Data, result); err != nil {
+					return fmt.Errorf("unmarshal graphql data: %w", err)
 				}
 			}
 
-			msgs := make([]string, len(gqlResp.Errors))
-			for i, ge := range gqlResp.Errors {
-				msgs[i] = ge.String()
-			}
-			return fmt.Errorf("graphql error: %s", strings.Join(msgs, "; "))
-		}
-
-		if result != nil && len(gqlResp.Data) > 0 {
-			if err := json.Unmarshal(gqlResp.Data, result); err != nil {
-				return fmt.Errorf("unmarshal graphql data: %w", err)
-			}
-		}
-
-		return nil
-	}, c.retryOpts)
+			return nil
+		}, c.retryOpts)
+	})
 }
 
 // SearchPRsForIssue returns all PRs that reference the given issue number.
