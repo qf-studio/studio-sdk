@@ -30,12 +30,38 @@ var (
 // Adapter implements core.Adapter, core.Pollable, and core.WebhookCapable for GitHub.
 type Adapter struct {
 	config *Config
+	client *Client // optional client injected via WithAdapterClient; nil means NewPoller constructs one from config.Token
+}
+
+// AdapterOption configures an Adapter created via New.
+type AdapterOption func(*Adapter)
+
+// WithAdapterClient injects a pre-built *Client for NewPoller to use instead
+// of constructing one from Config.Token. Use this to route the adapter's
+// internal poller, MergeWaiter, and board sync/source through a client built
+// with NewClientWithTokenFunc, so long-lived hosts under GitHub App auth
+// (installation tokens expire hourly) don't freeze a boot-time token inside
+// the adapter. A nil client is a no-op: NewPoller falls back to constructing
+// a static-token client from Config.Token, matching pre-injection behavior.
+func WithAdapterClient(client *Client) AdapterOption {
+	return func(a *Adapter) {
+		if client != nil {
+			a.client = client
+		}
+	}
 }
 
 // New creates a new GitHub adapter from the given configuration.
 // Call core.Register(github.New(cfg)) to make it available via the global registry.
-func New(cfg *Config) *Adapter {
-	return &Adapter{config: cfg}
+// By default NewPoller constructs its client from cfg.Token; pass
+// WithAdapterClient to inject a client instead (e.g. a TokenFunc-backed
+// client for rotating credentials).
+func New(cfg *Config, opts ...AdapterOption) *Adapter {
+	a := &Adapter{config: cfg}
+	for _, opt := range opts {
+		opt(a)
+	}
+	return a
 }
 
 // Name returns the adapter identifier.
@@ -48,10 +74,8 @@ func (a *Adapter) WebhookSource() string { return "github" }
 // It bridges core.PollerDeps (IssueHandler, ProcessedStore, OnPRCreated) into
 // the GitHub-specific Poller, converting *Issue ↔ core.IssueEvent at the boundary.
 func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
-	var client *Client
-	if a.config.Repo == "" {
-		client = NewClient(a.config.Token)
-	} else {
+	client := a.client
+	if client == nil {
 		client = NewClient(a.config.Token)
 	}
 

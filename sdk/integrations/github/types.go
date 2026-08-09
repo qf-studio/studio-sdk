@@ -5,7 +5,7 @@ import "time"
 // Config holds GitHub adapter configuration
 type Config struct {
 	Enabled           bool                     `yaml:"enabled"`
-	Token             string                   `yaml:"token"`          // Personal Access Token or GitHub App token
+	Token             string                   `yaml:"token"`          // Personal Access Token or GitHub App token. Rotating-token hosts (e.g. GitHub App installation tokens) should leave this empty and instead call New with WithAdapterClient(NewClientWithTokenFunc(...)) so the poller never freezes a boot-time token.
 	WebhookSecret     string                   `yaml:"webhook_secret"` // For HMAC signature verification
 	TriggerLabel      string                   `yaml:"trigger_label"`
 	Repo              string                   `yaml:"repo"`                // Default repo in "owner/repo" format
