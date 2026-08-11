@@ -156,6 +156,34 @@ type ExecutionSaver interface {
 	SaveDeclinedExecution(taskID, projectPath, status, reason string) error
 }
 
+// DeclinedExecutionRecord is the repo-aware evolution of the arguments to
+// ExecutionSaver.SaveDeclinedExecution. RepoOwner/RepoName carry the issue's
+// actual repo identity, distinct from ProjectPath: when a single local
+// checkout (ProjectPath) is polled against multiple repos, ProjectPath alone
+// cannot disambiguate which repo a declined issue came from, so records keyed
+// only on it collide across projects (see GH-4833 — the same shared-path
+// collision that corrupted canary attribution in the consumer's metrics).
+type DeclinedExecutionRecord struct {
+	TaskID      string
+	ProjectPath string
+	Status      string
+	Reason      string
+	RepoOwner   string
+	RepoName    string
+}
+
+// ExecutionSaverV2 is the repo-aware evolution of ExecutionSaver. Consumers
+// that implement it receive SaveDeclinedExecutionRecord calls carrying the
+// issue's repo identity; consumers that only implement ExecutionSaver keep
+// receiving SaveDeclinedExecution calls unchanged. Pollers detect which
+// interface a wired ExecutionSaver satisfies at the call site and prefer
+// ExecutionSaverV2 when available, so existing consumers compile and behave
+// exactly as before without modification.
+type ExecutionSaverV2 interface {
+	ExecutionSaver
+	SaveDeclinedExecutionRecord(rec DeclinedExecutionRecord) error
+}
+
 // IssueMetricsRecorder records issue processing outcomes (e.g. "rate_limited").
 type IssueMetricsRecorder interface {
 	RecordIssueProcessed(result string)

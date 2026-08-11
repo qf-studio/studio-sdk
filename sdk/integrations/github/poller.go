@@ -1596,7 +1596,9 @@ func (p *Poller) passesPreFlight(ctx context.Context, issue *Issue) bool {
 // handlePreFlightReject handles an issue rejected by the pre-flight judge:
 //   - adds the needs-clarification label so the issue is filtered on later polls
 //   - posts a comment explaining the decision and how to re-trigger
-//   - saves a declined-preflight execution record if an ExecutionSaver is wired
+//   - saves a declined-preflight execution record if an ExecutionSaver is
+//     wired, carrying the issue's repo identity (owner/name) when the wired
+//     saver implements ExecutionSaverV2
 //
 // The caller must NOT mark the issue processed, so label removal re-triggers dispatch.
 func (p *Poller) handlePreFlightReject(ctx context.Context, issue *Issue, verdict core.Verdict) {
@@ -1623,7 +1625,20 @@ func (p *Poller) handlePreFlightReject(ctx context.Context, issue *Issue, verdic
 	}
 
 	if p.execSaver != nil {
-		if err := p.execSaver.SaveDeclinedExecution(taskID, p.projectPath, "declined-preflight", verdict.Reason); err != nil {
+		var err error
+		if v2, ok := p.execSaver.(core.ExecutionSaverV2); ok {
+			err = v2.SaveDeclinedExecutionRecord(core.DeclinedExecutionRecord{
+				TaskID:      taskID,
+				ProjectPath: p.projectPath,
+				Status:      "declined-preflight",
+				Reason:      verdict.Reason,
+				RepoOwner:   p.owner,
+				RepoName:    p.repo,
+			})
+		} else {
+			err = p.execSaver.SaveDeclinedExecution(taskID, p.projectPath, "declined-preflight", verdict.Reason)
+		}
+		if err != nil {
 			p.logger.Warn("pre-flight: failed to save execution record",
 				slog.Int("issue", issue.Number),
 				slog.Any("error", err))
