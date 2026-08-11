@@ -57,6 +57,15 @@ type ChatDeps struct {
 
 type Cursor string
 
+type DeclinedExecutionRecord struct {
+	TaskID string
+	ProjectPath string
+	Status string
+	Reason string
+	RepoOwner string
+	RepoName string
+}
+
 type ExecutionChecker interface {
 	HasCompletedExecution(taskID, projectPath string) (bool, error)
 	InvalidateCompletion(taskID, projectPath string) error
@@ -64,6 +73,11 @@ type ExecutionChecker interface {
 
 type ExecutionSaver interface {
 	SaveDeclinedExecution(taskID, projectPath, status, reason string) error
+}
+
+type ExecutionSaverV2 interface {
+	ExecutionSaver
+	SaveDeclinedExecutionRecord(rec DeclinedExecutionRecord) error
 }
 
 type FieldPatch map[string]any

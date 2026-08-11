@@ -71,6 +71,29 @@ func (f *fakeExecSaver) SaveDeclinedExecution(taskID, projectPath, status, reaso
 	return nil
 }
 
+// fakeExecSaverV2 implements core.ExecutionSaverV2. legacyCalls tracks calls
+// to the embedded ExecutionSaver method so tests can assert the poller
+// prefers SaveDeclinedExecutionRecord when both are available.
+type fakeExecSaverV2 struct {
+	mu          sync.Mutex
+	records     []core.DeclinedExecutionRecord
+	legacyCalls int
+}
+
+func (f *fakeExecSaverV2) SaveDeclinedExecution(taskID, projectPath, status, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.legacyCalls++
+	return nil
+}
+
+func (f *fakeExecSaverV2) SaveDeclinedExecutionRecord(rec core.DeclinedExecutionRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.records = append(f.records, rec)
+	return nil
+}
+
 type fakeIssueMetrics struct {
 	mu      sync.Mutex
 	results []string
@@ -198,6 +221,62 @@ func TestPoller_PreFlightReject_LabelsCommentsAndSkips(t *testing.T) {
 	rec := records[0]
 	if rec.taskID != "GH-42" || rec.status != "declined-preflight" ||
 		rec.reason != "no acceptance criteria" || rec.projectPath != "/tmp/proj" {
+		t.Errorf("unexpected declined record: %+v", rec)
+	}
+}
+
+// TestPoller_PreFlightReject_ExecutionSaverV2CarriesRepoIdentity verifies the
+// GH-111 fix: a declined issue's record carries the issue's actual repo
+// (owner/name), not just the shared ProjectPath — the GH-4833 root cause was
+// that a single checkout path polled against multiple repos collides when
+// records are keyed on ProjectPath alone. The wired saver is deliberately a
+// non-default repo ("acme/widget") with a ProjectPath that looks like a
+// shared checkout, to prove RepoOwner/RepoName come from the issue's poller,
+// not from ProjectPath.
+func TestPoller_PreFlightReject_ExecutionSaverV2CarriesRepoIdentity(t *testing.T) {
+	ts := newPollerTestServer(hookTestIssue())
+	defer ts.close()
+
+	judge := &fakeJudge{verdict: core.Verdict{
+		Accepted: false, Decision: "too_vague", Reason: "no acceptance criteria", Confidence: 0.9,
+	}}
+	saver := &fakeExecSaverV2{}
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
+	poller, err := NewPoller(client, "acme/widget", "pilot", 30*time.Second,
+		WithOnIssue(func(ctx context.Context, iss *Issue) error { return nil }),
+		WithRetryGracePeriod(0),
+		WithPreFlightJudge(judge),
+		WithExecutionSaver(saver),
+		WithExecutionChecker(nil, "/tmp/shared-project"), // sets projectPath only; checker stays nil
+	)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+	poller.execChecker = nil // explicit: only projectPath threading is under test here
+
+	poller.checkForNewIssues(context.Background())
+	poller.WaitForActive()
+
+	saver.mu.Lock()
+	records := append([]core.DeclinedExecutionRecord(nil), saver.records...)
+	legacyCalls := saver.legacyCalls
+	saver.mu.Unlock()
+
+	if legacyCalls != 0 {
+		t.Errorf("legacy SaveDeclinedExecution called %d times; ExecutionSaverV2 must take priority", legacyCalls)
+	}
+	if len(records) != 1 {
+		t.Fatalf("declined execution records = %d, want 1", len(records))
+	}
+	rec := records[0]
+	if rec.RepoOwner != "acme" || rec.RepoName != "widget" {
+		t.Errorf("declined record repo = %s/%s, want acme/widget (must reflect the issue's repo, not the shared project path)", rec.RepoOwner, rec.RepoName)
+	}
+	if rec.ProjectPath != "/tmp/shared-project" {
+		t.Errorf("declined record projectPath = %q, want /tmp/shared-project", rec.ProjectPath)
+	}
+	if rec.TaskID != "GH-42" || rec.Status != "declined-preflight" || rec.Reason != "no acceptance criteria" {
 		t.Errorf("unexpected declined record: %+v", rec)
 	}
 }
