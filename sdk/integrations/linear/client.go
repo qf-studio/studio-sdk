@@ -23,6 +23,9 @@ type Client struct {
 
 	doneStateMu    sync.RWMutex
 	doneStateCache map[string]string
+
+	teamIDMu    sync.RWMutex
+	teamIDCache map[string]string
 }
 
 // NewClient creates a new Linear client.
@@ -34,6 +37,7 @@ func NewClient(apiKey string) *Client {
 			Timeout: 30 * time.Second,
 		},
 		doneStateCache: make(map[string]string),
+		teamIDCache:    make(map[string]string),
 	}
 }
 
@@ -46,6 +50,7 @@ func NewClientWithBaseURL(apiKey, baseURL string) *Client {
 			Timeout: 30 * time.Second,
 		},
 		doneStateCache: make(map[string]string),
+		teamIDCache:    make(map[string]string),
 	}
 }
 
@@ -576,8 +581,60 @@ func (c *Client) getWorkspaceLabelByName(ctx context.Context, teamID, labelName 
 	return "", fmt.Errorf("label %q not found in team %s", labelName, teamID)
 }
 
+// ResolveTeamID resolves a team key (e.g. "ENG") to the team's UUID, passing
+// an already-UUID value through untouched. Results are cached; team keys
+// rarely change.
+func (c *Client) ResolveTeamID(ctx context.Context, teamRef string) (string, error) {
+	if looksLikeUUID(teamRef) {
+		return teamRef, nil
+	}
+
+	c.teamIDMu.RLock()
+	if id, ok := c.teamIDCache[teamRef]; ok {
+		c.teamIDMu.RUnlock()
+		return id, nil
+	}
+	c.teamIDMu.RUnlock()
+
+	query := `
+		query ResolveTeam($key: String!) {
+			teams(filter: { key: { eq: $key } }) {
+				nodes { id key name }
+			}
+		}
+	`
+
+	var result struct {
+		Teams struct {
+			Nodes []struct {
+				ID string `json:"id"`
+			} `json:"nodes"`
+		} `json:"teams"`
+	}
+
+	if err := c.Execute(ctx, query, map[string]interface{}{"key": teamRef}, &result); err != nil {
+		return "", err
+	}
+	if len(result.Teams.Nodes) == 0 {
+		return "", fmt.Errorf("no team found with key %q", teamRef)
+	}
+
+	id := result.Teams.Nodes[0].ID
+	c.teamIDMu.Lock()
+	c.teamIDCache[teamRef] = id
+	c.teamIDMu.Unlock()
+	return id, nil
+}
+
 // CreateLabel creates a new label in a team and returns its ID.
+// teamID may be the team key or the team UUID — issueLabelCreate requires the
+// UUID, so a key is resolved first.
 func (c *Client) CreateLabel(ctx context.Context, teamID, labelName, color string) (string, error) {
+	teamUUID, err := c.ResolveTeamID(ctx, teamID)
+	if err != nil {
+		return "", fmt.Errorf("resolving team for label %q: %w", labelName, err)
+	}
+
 	mutation := `
 		mutation CreateLabel($teamId: String!, $name: String!, $color: String!) {
 			issueLabelCreate(input: { teamId: $teamId, name: $name, color: $color }) {
@@ -601,7 +658,7 @@ func (c *Client) CreateLabel(ctx context.Context, teamID, labelName, color strin
 	}
 
 	if err := c.Execute(ctx, mutation, map[string]interface{}{
-		"teamId": teamID,
+		"teamId": teamUUID,
 		"name":   labelName,
 		"color":  color,
 	}, &result); err != nil {
