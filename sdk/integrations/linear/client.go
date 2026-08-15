@@ -535,10 +535,45 @@ func (c *Client) GetLabelByName(ctx context.Context, teamID, labelName string) (
 	}
 
 	if len(result.IssueLabels.Nodes) == 0 {
-		return "", fmt.Errorf("label %q not found in team %s", labelName, teamID)
+		return c.getWorkspaceLabelByName(ctx, teamID, labelName)
 	}
 
 	return result.IssueLabels.Nodes[0].ID, nil
+}
+
+// getWorkspaceLabelByName finds a label with no owning team — Linear creates
+// labels workspace-scoped by default from the issue view, and those never
+// match GetLabelByName's team-filtered query.
+func (c *Client) getWorkspaceLabelByName(ctx context.Context, teamID, labelName string) (string, error) {
+	query := `
+		query GetWorkspaceLabel($name: String!) {
+			issueLabels(filter: { name: { eq: $name } }) {
+				nodes { id name team { id } }
+			}
+		}
+	`
+	var result struct {
+		IssueLabels struct {
+			Nodes []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+				Team *struct {
+					ID string `json:"id"`
+				} `json:"team"`
+			} `json:"nodes"`
+		} `json:"issueLabels"`
+	}
+
+	if err := c.Execute(ctx, query, map[string]interface{}{"name": labelName}, &result); err != nil {
+		return "", err
+	}
+
+	for _, node := range result.IssueLabels.Nodes {
+		if node.Team == nil {
+			return node.ID, nil
+		}
+	}
+	return "", fmt.Errorf("label %q not found in team %s", labelName, teamID)
 }
 
 // CreateLabel creates a new label in a team and returns its ID.
