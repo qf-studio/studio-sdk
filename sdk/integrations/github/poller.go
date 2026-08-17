@@ -116,6 +116,15 @@ type Poller struct {
 	execSaver          core.ExecutionSaver
 	issueMetrics       core.IssueMetricsRecorder
 	rateLimitScheduler core.RateLimitScheduler
+
+	// defaultBranch is resolved lazily (once per poller instance) on the first
+	// hasMergedWork call and cached for the poller's lifetime. defaultBranchOK
+	// is false if resolution failed (e.g. API error) — hasMergedWork then falls
+	// back to the base-blind legacy behavior rather than wedging polling
+	// (GH-117).
+	defaultBranchOnce sync.Once
+	defaultBranch     string
+	defaultBranchOK   bool
 }
 
 // PollerOption configures a Poller.
@@ -1228,9 +1237,42 @@ func (p *Poller) unmarkProcessed(number int) {
 	}
 }
 
-// hasMergedWork checks if the issue already has merged PRs.
+// resolveDefaultBranch resolves and caches the repo's default branch, once per
+// poller instance. On API error it logs a single WARN and returns ok=false —
+// callers must fall back to base-blind legacy behavior rather than blocking
+// polling on a repo-metadata fetch (GH-117).
+func (p *Poller) resolveDefaultBranch(ctx context.Context) (branch string, ok bool) {
+	p.defaultBranchOnce.Do(func() {
+		repository, err := p.client.GetRepository(ctx, p.owner, p.repo)
+		if err != nil || repository == nil || repository.DefaultBranch == "" {
+			p.logger.Warn("Failed to resolve default branch, falling back to legacy merged-PR detection (base branch not verified)",
+				slog.String("owner", p.owner),
+				slog.String("repo", p.repo),
+				slog.Any("error", err),
+			)
+			return
+		}
+		p.defaultBranch = repository.DefaultBranch
+		p.defaultBranchOK = true
+	})
+	return p.defaultBranch, p.defaultBranchOK
+}
+
+// hasMergedWork checks if the issue already has merged PRs. A PR merged into a
+// non-default base (e.g. a stacked PR squash-merged into its stack parent
+// branch, not main) is not treated as delivery — only a merge onto the repo's
+// default branch marks the issue done (GH-117). If the default branch cannot
+// be resolved, this falls back to the legacy base-blind checks (fail open).
 func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
-	found, err := p.client.SearchMergedPRsForIssue(ctx, p.owner, p.repo, issue.Number)
+	defaultBranch, haveDefaultBranch := p.resolveDefaultBranch(ctx)
+
+	var found bool
+	var err error
+	if haveDefaultBranch {
+		found, err = p.client.SearchMergedPRsForIssueOnBase(ctx, p.owner, p.repo, issue.Number, defaultBranch)
+	} else {
+		found, err = p.client.SearchMergedPRsForIssue(ctx, p.owner, p.repo, issue.Number)
+	}
 	if err != nil {
 		p.logger.Warn("Failed to check for merged PRs",
 			slog.Int("issue", issue.Number),
@@ -1240,22 +1282,57 @@ func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
 
 	if !found {
 		branch := fmt.Sprintf("pilot/GH-%d", issue.Number)
-		branchFound, berr := p.client.FindMergedPRByBranch(ctx, p.owner, p.repo, branch)
-		if berr != nil {
-			p.logger.Warn("Failed to check merged PRs by branch",
+		if haveDefaultBranch {
+			result, berr := p.client.FindMergedPRByBranchOnBase(ctx, p.owner, p.repo, branch, defaultBranch)
+			if berr != nil {
+				p.logger.Warn("Failed to check merged PRs by branch",
+					slog.Int("issue", issue.Number),
+					slog.String("branch", branch),
+					slog.Any("error", berr),
+				)
+				return false
+			}
+			switch {
+			case result.OnDefaultBranch:
+				found = true
+				p.logger.Info("Merged PR found via branch lookup",
+					slog.Int("issue", issue.Number),
+					slog.String("branch", branch),
+				)
+			case result.OtherBase != "":
+				p.logger.Info("Merged PR found via branch lookup but merged into non-default base, not treating as done",
+					slog.Int("issue", issue.Number),
+					slog.String("branch", branch),
+					slog.String("base", result.OtherBase),
+					slog.String("default_branch", defaultBranch),
+				)
+				return false
+			default:
+				return false
+			}
+		} else {
+			branchFound, berr := p.client.FindMergedPRByBranch(ctx, p.owner, p.repo, branch)
+			if berr != nil {
+				p.logger.Warn("Failed to check merged PRs by branch",
+					slog.Int("issue", issue.Number),
+					slog.String("branch", branch),
+					slog.Any("error", berr),
+				)
+				return false
+			}
+			if !branchFound {
+				return false
+			}
+			found = true
+			p.logger.Info("Merged PR found via branch lookup",
 				slog.Int("issue", issue.Number),
 				slog.String("branch", branch),
-				slog.Any("error", berr),
 			)
-			return false
 		}
-		if !branchFound {
-			return false
-		}
-		p.logger.Info("Merged PR found via branch lookup",
-			slog.Int("issue", issue.Number),
-			slog.String("branch", branch),
-		)
+	}
+
+	if !found {
+		return false
 	}
 
 	p.logger.Info("Issue already has merged PRs, marking as done",
