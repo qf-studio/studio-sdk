@@ -372,11 +372,12 @@ func TestGetRepository(t *testing.T) {
 			name:       "success",
 			statusCode: http.StatusOK,
 			response: Repository{
-				ID:       12345,
-				Name:     "repo",
-				FullName: "owner/repo",
-				Owner:    User{Login: "owner"},
-				CloneURL: "https://github.com/owner/repo.git",
+				ID:            12345,
+				Name:          "repo",
+				FullName:      "owner/repo",
+				Owner:         User{Login: "owner"},
+				CloneURL:      "https://github.com/owner/repo.git",
+				DefaultBranch: "main",
 			},
 			wantErr: false,
 		},
@@ -408,6 +409,9 @@ func TestGetRepository(t *testing.T) {
 			}
 			if !tt.wantErr && repo.Name != "repo" {
 				t.Errorf("repo.Name = %s, want repo", repo.Name)
+			}
+			if !tt.wantErr && repo.DefaultBranch != "main" {
+				t.Errorf("repo.DefaultBranch = %q, want %q", repo.DefaultBranch, "main")
 			}
 		})
 	}
@@ -2748,6 +2752,159 @@ func TestFindMergedPRByBranch(t *testing.T) {
 			}
 			if !tt.wantErr && found != tt.wantFound {
 				t.Errorf("FindMergedPRByBranch() = %v, want %v", found, tt.wantFound)
+			}
+		})
+	}
+}
+
+func TestSearchMergedPRsForIssueOnBase(t *testing.T) {
+	tests := []struct {
+		name        string
+		issueNumber int
+		base        string
+		statusCode  int
+		response    string
+		wantFound   bool
+		wantErr     bool
+	}{
+		{
+			name:        "merged PR on default base",
+			issueNumber: 42,
+			base:        "main",
+			statusCode:  http.StatusOK,
+			response:    `{"total_count": 1}`,
+			wantFound:   true,
+		},
+		{
+			name:        "no merged PR on default base",
+			issueNumber: 43,
+			base:        "main",
+			statusCode:  http.StatusOK,
+			response:    `{"total_count": 0}`,
+			wantFound:   false,
+		},
+		{
+			name:        "API error",
+			issueNumber: 44,
+			base:        "main",
+			statusCode:  http.StatusForbidden,
+			response:    `{"message": "rate limit"}`,
+			wantErr:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/search/issues") {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				q := r.URL.Query().Get("q")
+				expectedQ := fmt.Sprintf("repo:owner/repo GH-%d in:title is:pr is:merged base:%s", tt.issueNumber, tt.base)
+				if q != expectedQ {
+					t.Errorf("query = %q, want %q", q, expectedQ)
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+			found, err := client.SearchMergedPRsForIssueOnBase(context.Background(), "owner", "repo", tt.issueNumber, tt.base)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("SearchMergedPRsForIssueOnBase() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && found != tt.wantFound {
+				t.Errorf("SearchMergedPRsForIssueOnBase() = %v, want %v", found, tt.wantFound)
+			}
+		})
+	}
+}
+
+func TestFindMergedPRByBranchOnBase(t *testing.T) {
+	tests := []struct {
+		name          string
+		branch        string
+		defaultBranch string
+		response      string
+		statusCode    int
+		wantOnDefault bool
+		wantOtherBase string
+		wantErr       bool
+	}{
+		{
+			name:          "merged PR on default branch",
+			branch:        "pilot/GH-42",
+			defaultBranch: "main",
+			statusCode:    http.StatusOK,
+			response:      `[{"number": 100, "merged_at": "2026-04-17T14:01:40Z", "base": {"ref": "main"}}]`,
+			wantOnDefault: true,
+		},
+		{
+			name:          "merged PR on non-default base (stacked merge)",
+			branch:        "pilot/GH-117",
+			defaultBranch: "main",
+			statusCode:    http.StatusOK,
+			response:      `[{"number": 200, "merged_at": "2026-08-15T10:00:00Z", "base": {"ref": "pilot/GH-70"}}]`,
+			wantOnDefault: false,
+			wantOtherBase: "pilot/GH-70",
+		},
+		{
+			name:          "closed but not merged",
+			branch:        "pilot/GH-43",
+			defaultBranch: "main",
+			statusCode:    http.StatusOK,
+			response:      `[{"number": 101, "merged_at": "", "base": {"ref": "main"}}]`,
+			wantOnDefault: false,
+		},
+		{
+			name:          "no PRs on branch",
+			branch:        "pilot/GH-44",
+			defaultBranch: "main",
+			statusCode:    http.StatusOK,
+			response:      `[]`,
+			wantOnDefault: false,
+		},
+		{
+			name:          "API error",
+			branch:        "pilot/GH-45",
+			defaultBranch: "main",
+			statusCode:    http.StatusForbidden,
+			response:      `{"message":"rate limit"}`,
+			wantErr:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/repos/owner/repo/pulls" {
+					t.Errorf("unexpected path: %s", r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.WriteHeader(tt.statusCode)
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+			result, err := client.FindMergedPRByBranchOnBase(context.Background(), "owner", "repo", tt.branch, tt.defaultBranch)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("FindMergedPRByBranchOnBase() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.wantErr {
+				return
+			}
+			if result.OnDefaultBranch != tt.wantOnDefault {
+				t.Errorf("OnDefaultBranch = %v, want %v", result.OnDefaultBranch, tt.wantOnDefault)
+			}
+			if result.OtherBase != tt.wantOtherBase {
+				t.Errorf("OtherBase = %q, want %q", result.OtherBase, tt.wantOtherBase)
 			}
 		})
 	}

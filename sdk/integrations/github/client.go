@@ -228,13 +228,14 @@ type User struct {
 
 // Repository represents a GitHub repository
 type Repository struct {
-	ID       int64  `json:"id"`
-	Name     string `json:"name"`
-	FullName string `json:"full_name"`
-	Owner    User   `json:"owner"`
-	HTMLURL  string `json:"html_url"`
-	CloneURL string `json:"clone_url"`
-	SSHURL   string `json:"ssh_url"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	FullName      string `json:"full_name"`
+	Owner         User   `json:"owner"`
+	HTMLURL       string `json:"html_url"`
+	CloneURL      string `json:"clone_url"`
+	SSHURL        string `json:"ssh_url"`
+	DefaultBranch string `json:"default_branch"`
 }
 
 // Comment represents a GitHub issue comment
@@ -1198,6 +1199,11 @@ func (c *Client) GetAuthenticatedUser(ctx context.Context) (*User, error) {
 
 // SearchMergedPRsForIssue checks if any merged PRs exist that reference the given
 // issue number in their title. Returns true if at least one merged PR is found.
+//
+// This does not filter by base branch: a merge into a non-default base (e.g. a
+// stacked PR squash-merged into another feature branch) is indistinguishable from
+// a real delivery here. Prefer SearchMergedPRsForIssueOnBase when the default
+// branch is known (GH-117).
 func (c *Client) SearchMergedPRsForIssue(ctx context.Context, owner, repo string, issueNumber int) (bool, error) {
 	q := fmt.Sprintf("repo:%s/%s GH-%d in:title is:pr is:merged", owner, repo, issueNumber)
 	path := fmt.Sprintf("/search/issues?q=%s&per_page=1", url.QueryEscape(q))
@@ -1211,8 +1217,29 @@ func (c *Client) SearchMergedPRsForIssue(ctx context.Context, owner, repo string
 	return result.TotalCount > 0, nil
 }
 
+// SearchMergedPRsForIssueOnBase is the base-aware counterpart to
+// SearchMergedPRsForIssue: it adds a base: qualifier so a PR merged into a
+// non-default branch (e.g. a stacked PR landing on its stack parent, not main)
+// does not count as delivery (GH-117).
+func (c *Client) SearchMergedPRsForIssueOnBase(ctx context.Context, owner, repo string, issueNumber int, base string) (bool, error) {
+	q := fmt.Sprintf("repo:%s/%s GH-%d in:title is:pr is:merged base:%s", owner, repo, issueNumber, base)
+	path := fmt.Sprintf("/search/issues?q=%s&per_page=1", url.QueryEscape(q))
+
+	var result struct {
+		TotalCount int `json:"total_count"`
+	}
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
+		return false, fmt.Errorf("search merged PRs for issue %d on base %s: %w", issueNumber, base, err)
+	}
+	return result.TotalCount > 0, nil
+}
+
 // FindMergedPRByBranch looks up PRs by head branch via the strongly-consistent REST API.
 // Returns true if any PR on that branch is merged.
+//
+// This does not check the merge base: a PR squash-merged into a non-default
+// branch (stacked PR) is indistinguishable from a real delivery here. Prefer
+// FindMergedPRByBranchOnBase when the default branch is known (GH-117).
 func (c *Client) FindMergedPRByBranch(ctx context.Context, owner, repo, branch string) (bool, error) {
 	head := fmt.Sprintf("%s:%s", owner, branch)
 	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s&state=closed&per_page=10",
@@ -1228,6 +1255,50 @@ func (c *Client) FindMergedPRByBranch(ctx context.Context, owner, repo, branch s
 		}
 	}
 	return false, nil
+}
+
+// MergedPRBranchResult is the result of a base-aware merged-PR-by-branch lookup.
+// It distinguishes "no merged PR" from "merged PR landed on a different base"
+// (e.g. a stacked PR squash-merged into its stack parent branch instead of
+// main) so callers can log the stacked-merge case distinctly rather than
+// silently treating it as no work done (GH-117).
+type MergedPRBranchResult struct {
+	// OnDefaultBranch is true if a merged PR was found whose base ref equals
+	// the supplied default branch.
+	OnDefaultBranch bool
+	// OtherBase is the base ref of a merged PR found on the branch whose base
+	// did NOT match the default branch. Empty if no such PR was found.
+	OtherBase string
+}
+
+// FindMergedPRByBranchOnBase is the base-aware counterpart to
+// FindMergedPRByBranch: it only reports OnDefaultBranch=true when a merged PR's
+// base ref matches defaultBranch, and separately surfaces the base of a merged
+// PR that landed elsewhere so callers can log the stacked-merge case (GH-117).
+func (c *Client) FindMergedPRByBranchOnBase(ctx context.Context, owner, repo, branch, defaultBranch string) (*MergedPRBranchResult, error) {
+	head := fmt.Sprintf("%s:%s", owner, branch)
+	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s&state=closed&per_page=10",
+		owner, repo, url.QueryEscape(head))
+
+	var prs []*PullRequest
+	if err := c.doRequest(ctx, http.MethodGet, path, nil, &prs); err != nil {
+		return nil, fmt.Errorf("list PRs by branch %s: %w", branch, err)
+	}
+
+	result := &MergedPRBranchResult{}
+	for _, pr := range prs {
+		if pr.MergedAt == "" && !pr.Merged {
+			continue
+		}
+		if pr.Base.Ref == defaultBranch {
+			result.OnDefaultBranch = true
+			return result, nil
+		}
+		if result.OtherBase == "" {
+			result.OtherBase = pr.Base.Ref
+		}
+	}
+	return result, nil
 }
 
 // FindOpenPRByBranch looks up OPEN PRs by head branch via the strongly-consistent
