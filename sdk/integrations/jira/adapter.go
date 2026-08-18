@@ -107,7 +107,7 @@ func toIssueEvent(issue *Issue) core.IssueEvent {
 		IssueID:    issue.ID,
 		SequenceID: "JIRA-" + issue.Key,
 		Title:      issue.Fields.Summary,
-		Body:       issue.Fields.Description,
+		Body:       string(issue.Fields.Description),
 		Labels:     labels,
 		Priority:   core.NormalizePriority(priority),
 		ProjectID:  issue.Fields.Project.Key,

@@ -14,7 +14,9 @@ import (
 func sanitizeIssueInPlace(issue *Issue, logger *slog.Logger) {
 	var summaryStripped, descStripped int
 	issue.Fields.Summary, summaryStripped = text.SanitizeUntrusted(issue.Fields.Summary)
-	issue.Fields.Description, descStripped = text.SanitizeUntrusted(issue.Fields.Description)
+
+	sanitizedDesc, n := text.SanitizeUntrusted(string(issue.Fields.Description))
+	issue.Fields.Description, descStripped = ADFText(sanitizedDesc), n
 	if summaryStripped+descStripped > 0 {
 		logger.Warn(
 			"invisible_unicode_stripped",

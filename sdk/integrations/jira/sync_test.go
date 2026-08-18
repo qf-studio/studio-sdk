@@ -53,7 +53,7 @@ func testIssue(key, statusName, categoryKey string) *Issue {
 		Key: key,
 		Fields: Fields{
 			Summary:     "Summary " + key,
-			Description: "Description " + key,
+			Description: ADFText("Description " + key),
 			Status: Status{
 				Name:           statusName,
 				StatusCategory: StatusCategory{Key: categoryKey, Name: statusName},
