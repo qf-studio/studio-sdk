@@ -1,6 +1,12 @@
 package jira
 
-import "time"
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+)
 
 // Config holds Jira adapter configuration.
 type Config struct {
@@ -108,7 +114,7 @@ type Issue struct {
 // Fields represents Jira issue fields.
 type Fields struct {
 	Summary     string        `json:"summary"`
-	Description string        `json:"description"`
+	Description ADFText       `json:"description"`
 	IssueType   IssueType     `json:"issuetype"`
 	Status      Status        `json:"status"`
 	Priority    *JiraPriority `json:"priority,omitempty"`
@@ -122,9 +128,72 @@ type Fields struct {
 
 // IssueType represents a Jira issue type.
 type IssueType struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Description ADFText `json:"description"`
+}
+
+// ADFText is a Jira text field that may arrive either as a plain string
+// (Server/DC, and some Cloud v2-shaped payloads) or as an Atlassian Document
+// Format (ADF) object (Cloud's POST /rest/api/3/search/jql, which returns
+// rich-text fields like description as ADF rather than plain text). It always
+// unmarshals to plain text, so callers can treat it as a normal string.
+type ADFText string
+
+// UnmarshalJSON implements json.Unmarshaler. It first tries to decode data as
+// a plain JSON string; if that fails, it falls back to decoding an ADF
+// document object and extracting the concatenated text content.
+func (t *ADFText) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		*t = ""
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		*t = ADFText(s)
+		return nil
+	}
+
+	var adf map[string]interface{}
+	if err := json.Unmarshal(data, &adf); err != nil {
+		return fmt.Errorf("field is neither a plain string nor an ADF object: %w", err)
+	}
+
+	*t = ADFText(extractADFText(adf))
+	return nil
+}
+
+// extractADFText extracts plain text from an Atlassian Document Format (ADF)
+// node tree, as returned for rich-text fields (description, comment body,
+// etc.) on Jira Cloud.
+func extractADFText(adf map[string]interface{}) string {
+	var sb strings.Builder
+	extractADFTextRecursive(adf, &sb)
+	return strings.TrimSpace(sb.String())
+}
+
+// extractADFTextRecursive recursively walks ADF content nodes, concatenating
+// text nodes and inserting a newline after block-level nodes (paragraph,
+// heading, listItem).
+func extractADFTextRecursive(node map[string]interface{}, sb *strings.Builder) {
+	if t, ok := node["text"].(string); ok {
+		sb.WriteString(t)
+	}
+
+	if content, ok := node["content"].([]interface{}); ok {
+		for _, item := range content {
+			if itemMap, ok := item.(map[string]interface{}); ok {
+				extractADFTextRecursive(itemMap, sb)
+			}
+		}
+		if nodeType, ok := node["type"].(string); ok {
+			if nodeType == "paragraph" || nodeType == "heading" || nodeType == "listItem" {
+				sb.WriteString("\n")
+			}
+		}
+	}
 }
 
 // Status represents a Jira status.

@@ -125,7 +125,7 @@ func (s *SyncClient) toSnapshot(issue *Issue) core.IssueSnapshot {
 		NativeID:   issue.Key,
 		SequenceID: issue.Key,
 		Title:      issue.Fields.Summary,
-		Body:       issue.Fields.Description,
+		Body:       string(issue.Fields.Description),
 		State:      issue.Fields.Status.Name,
 		StateGroup: stateGroup(issue.Fields.Status.StatusCategory),
 		Labels:     labels,

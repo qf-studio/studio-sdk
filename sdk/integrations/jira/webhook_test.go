@@ -467,9 +467,6 @@ func TestExtractIssue_MissingIssue(t *testing.T) {
 }
 
 func TestExtractADFText(t *testing.T) {
-	client := NewClient("https://jira.example.com", "user", testutil.FakeJiraToken, PlatformCloud)
-	handler := NewWebhookHandler(client, "", "pilot")
-
 	tests := []struct {
 		name string
 		adf  map[string]interface{}
@@ -526,7 +523,7 @@ func TestExtractADFText(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := handler.extractADFText(tt.adf)
+			got := extractADFText(tt.adf)
 			if got != tt.want {
 				t.Errorf("extractADFText() = %q, want %q", got, tt.want)
 			}

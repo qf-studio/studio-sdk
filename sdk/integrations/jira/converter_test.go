@@ -226,7 +226,7 @@ func TestASCIISmuggling_SanitizeIssueInPlace(t *testing.T) {
 		Key: "PROJ-1337",
 		Fields: Fields{
 			Summary:     "Fix typo" + hidden,
-			Description: "Line 2 needs fix." + hidden,
+			Description: ADFText("Line 2 needs fix." + hidden),
 			Project:     Project{Key: "PROJ"},
 		},
 	}
@@ -236,7 +236,7 @@ func TestASCIISmuggling_SanitizeIssueInPlace(t *testing.T) {
 	if hasAnyInvisible(issue.Fields.Summary) {
 		t.Errorf("Summary retained invisible runes: %q", issue.Fields.Summary)
 	}
-	if hasAnyInvisible(issue.Fields.Description) {
+	if hasAnyInvisible(string(issue.Fields.Description)) {
 		t.Errorf("Description retained invisible runes: %q", issue.Fields.Description)
 	}
 	if issue.Fields.Summary != "Fix typo" {

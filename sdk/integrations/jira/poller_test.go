@@ -366,7 +366,7 @@ func TestPoller_SanitizeCalledInLivePath(t *testing.T) {
 	poller := NewPoller(client, config, 30*time.Second,
 		WithOnJiraIssue(func(ctx context.Context, issue *Issue) (*IssueResult, error) {
 			capturedTitle = issue.Fields.Summary
-			capturedDesc = issue.Fields.Description
+			capturedDesc = string(issue.Fields.Description)
 			return &IssueResult{Success: true}, nil
 		}),
 	)
@@ -376,7 +376,7 @@ func TestPoller_SanitizeCalledInLivePath(t *testing.T) {
 		Key: "TEST-99",
 		Fields: Fields{
 			Summary:     dirtyTitle,
-			Description: dirtyDesc,
+			Description: ADFText(dirtyDesc),
 			Labels:      []string{"pilot"},
 		},
 	}

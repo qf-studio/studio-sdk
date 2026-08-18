@@ -95,6 +95,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 				return &AuthError{StatusCode: resp.StatusCode, Message: msg}
 			case http.StatusTooManyRequests:
 				return &RateLimitError{RetryAfter: parseRetryAfterHeader(resp.Header), Message: msg}
+			case http.StatusGone:
+				if strings.Contains(path, "/search") {
+					return fmt.Errorf("API error (status %d): %s (hint: Jira Cloud removed the legacy search endpoint in May 2025 — if this is a Cloud instance, set platform: cloud so the SDK uses POST /search/jql instead)", resp.StatusCode, msg)
+				}
 			}
 			return fmt.Errorf("API error (status %d): %s", resp.StatusCode, msg)
 		}

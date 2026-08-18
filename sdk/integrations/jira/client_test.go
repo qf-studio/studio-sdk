@@ -372,6 +372,91 @@ func TestSearchIssues_Cloud(t *testing.T) {
 	}
 }
 
+// TestSearchIssues_Cloud_MixedADFAndPlainDescriptions is the regression test
+// for GH-119 (pilot#4917/pilot#4929): a raw v3 search/jql page mixing an ADF
+// description (rich-text issue) with a plain-string description must parse
+// in full, with neither issue rejecting the page nor losing its text.
+func TestSearchIssues_Cloud_MixedADFAndPlainDescriptions(t *testing.T) {
+	const rawPage = `{
+		"issues": [
+			{
+				"id": "10001",
+				"key": "KAN-1",
+				"fields": {
+					"summary": "Rich text issue",
+					"description": {
+						"type": "doc",
+						"version": 1,
+						"content": [
+							{"type": "heading", "content": [{"type": "text", "text": "Overview"}]},
+							{"type": "paragraph", "content": [{"type": "text", "text": "This has headings and bullets."}]},
+							{"type": "bulletList", "content": [
+								{"type": "listItem", "content": [
+									{"type": "paragraph", "content": [{"type": "text", "text": "Point one"}]}
+								]}
+							]}
+						]
+					}
+				}
+			},
+			{
+				"id": "10002",
+				"key": "KAN-2",
+				"fields": {
+					"summary": "Plain text issue",
+					"description": "Just a plain description."
+				}
+			}
+		]
+	}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(rawPage))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "user@example.com", testutil.FakeJiraToken, PlatformCloud)
+	issues, err := client.SearchIssues(context.Background(), "project = KAN", 50)
+	if err != nil {
+		t.Fatalf("SearchIssues failed to parse mixed ADF/plain page: %v", err)
+	}
+	if len(issues) != 2 {
+		t.Fatalf("expected 2 issues, got %d", len(issues))
+	}
+
+	wantADF := "Overview\nThis has headings and bullets.\nPoint one"
+	if string(issues[0].Fields.Description) != wantADF {
+		t.Errorf("issues[0].Fields.Description = %q, want %q", issues[0].Fields.Description, wantADF)
+	}
+
+	wantPlain := "Just a plain description."
+	if string(issues[1].Fields.Description) != wantPlain {
+		t.Errorf("issues[1].Fields.Description = %q, want %q", issues[1].Fields.Description, wantPlain)
+	}
+}
+
+// TestSearchIssues_LegacySearchGone410_HintsCloudPlatform verifies that a 410
+// Gone from the legacy GET /rest/api/2/search endpoint (which Jira Cloud
+// returns since removing it in May 2025) is wrapped with an actionable hint
+// telling the operator to set platform: cloud.
+func TestSearchIssues_LegacySearchGone410_HintsCloudPlatform(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusGone)
+		_, _ = w.Write([]byte(`{"errorMessages":["This endpoint is no longer available"]}`))
+	}))
+	defer server.Close()
+
+	client := NewClient(server.URL, "admin", testutil.FakeJiraToken, PlatformServer)
+	_, err := client.SearchIssues(context.Background(), "labels = pilot", 50)
+	if err == nil {
+		t.Fatal("expected error for 410 response")
+	}
+	if !strings.Contains(err.Error(), "platform: cloud") {
+		t.Errorf("error = %q, want it to contain hint %q", err.Error(), "platform: cloud")
+	}
+}
+
 func TestSearchIssues_Server(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
