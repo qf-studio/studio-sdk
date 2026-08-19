@@ -43,8 +43,8 @@ func (a *Adapter) Name() string { return "asana" }
 func (a *Adapter) WebhookSource() string { return "asana" }
 
 // NewPoller creates a core.Poller backed by the Asana polling mechanism.
-// It bridges core.PollerDeps (IssueHandler, ProcessedStore) into the Asana-specific
-// Poller, converting *Task ↔ core.IssueEvent at the boundary.
+// It bridges core.PollerDeps (IssueHandler, ProcessedStore, OnPRCreated) into
+// the Asana-specific Poller, converting *Task ↔ core.IssueEvent at the boundary.
 func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	if !a.config.Enabled {
 		return &nopPoller{}
@@ -82,6 +82,12 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	}
 	if deps.MaxConcurrent > 0 {
 		opts = append(opts, WithMaxConcurrent(deps.MaxConcurrent))
+	}
+	if deps.OnPRCreated != nil {
+		fn := deps.OnPRCreated
+		opts = append(opts, WithOnPRCreated(func(ev core.PRCreatedEvent) {
+			fn(ev)
+		}))
 	}
 
 	return NewPoller(client, a.config, interval, opts...)

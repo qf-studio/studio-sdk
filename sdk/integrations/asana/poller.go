@@ -32,13 +32,14 @@ type TaskResult struct {
 
 // Poller polls Asana for tasks with the pilot tag.
 type Poller struct {
-	client    *Client
-	config    *Config
-	interval  time.Duration
-	processed map[string]bool
-	mu        sync.RWMutex
-	onTask    func(ctx context.Context, task *Task) (*TaskResult, error)
-	logger    *slog.Logger
+	client      *Client
+	config      *Config
+	interval    time.Duration
+	processed   map[string]bool
+	mu          sync.RWMutex
+	onTask      func(ctx context.Context, task *Task) (*TaskResult, error)
+	onPRCreated func(ev core.PRCreatedEvent)
+	logger      *slog.Logger
 
 	pilotTagGID      string
 	inProgressTagGID string
@@ -85,6 +86,13 @@ func WithMaxConcurrent(n int) PollerOption {
 			n = 1
 		}
 		p.maxConcurrent = n
+	}
+}
+
+// WithOnPRCreated sets the callback for when a PR is created for a task.
+func WithOnPRCreated(fn func(ev core.PRCreatedEvent)) PollerOption {
+	return func(p *Poller) {
+		p.onPRCreated = fn
 	}
 }
 
@@ -319,6 +327,16 @@ func (p *Poller) processTaskAsync(ctx context.Context, task *Task) {
 
 	if result != nil && result.Success && p.doneTagGID != "" {
 		_ = p.client.AddTag(ctx, task.GID, p.doneTagGID)
+	}
+
+	if result != nil && result.PRNumber > 0 && p.onPRCreated != nil {
+		p.onPRCreated(core.PRCreatedEvent{
+			PRNumber:   result.PRNumber,
+			PRURL:      result.PRURL,
+			IssueID:    task.GID,
+			HeadSHA:    result.HeadSHA,
+			BranchName: result.BranchName,
+		})
 	}
 }
 

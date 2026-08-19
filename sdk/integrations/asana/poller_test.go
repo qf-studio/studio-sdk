@@ -3,12 +3,14 @@ package asana
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/qf-studio/studio-sdk/sdk/core"
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
 )
 
@@ -735,6 +737,99 @@ func TestPollerSanitizeCalledInLivePath(t *testing.T) {
 
 	if gotName != want {
 		t.Errorf("sanitize not applied: got %q, want %q", gotName, want)
+	}
+}
+
+func TestPoller_OnPRCreated(t *testing.T) {
+	client := NewClient(testutil.FakeAsanaToken, testutil.FakeAsanaWorkspaceID)
+	config := &Config{TriggerLabel: "pilot"}
+
+	var prCallbackCalled int
+	var capturedEvent core.PRCreatedEvent
+	var mu sync.Mutex
+
+	poller := NewPoller(client, config, 30*time.Second,
+		WithOnAsanaTask(func(ctx context.Context, task *Task) (*TaskResult, error) {
+			return &TaskResult{
+				Success:    true,
+				PRNumber:   42,
+				PRURL:      "https://github.com/org/repo/pull/42",
+				HeadSHA:    "abc123",
+				BranchName: "pilot/ASANA-gid-1",
+			}, nil
+		}),
+		WithOnPRCreated(func(ev core.PRCreatedEvent) {
+			mu.Lock()
+			defer mu.Unlock()
+			prCallbackCalled++
+			capturedEvent = ev
+		}),
+	)
+
+	task := &Task{GID: "gid-1", Name: "Test Task"}
+
+	poller.semaphore <- struct{}{}
+	poller.wgMu.Lock()
+	poller.activeWg.Add(1)
+	poller.wgMu.Unlock()
+	go poller.processTaskAsync(context.Background(), task)
+	poller.WaitForActive()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if prCallbackCalled != 1 {
+		t.Errorf("OnPRCreated called %d times, want 1", prCallbackCalled)
+	}
+	if capturedEvent.PRNumber != 42 {
+		t.Errorf("PRNumber = %d, want 42", capturedEvent.PRNumber)
+	}
+	if capturedEvent.PRURL != "https://github.com/org/repo/pull/42" {
+		t.Errorf("PRURL = %q, want %q", capturedEvent.PRURL, "https://github.com/org/repo/pull/42")
+	}
+	if capturedEvent.IssueID != "gid-1" {
+		t.Errorf("IssueID = %q, want %q", capturedEvent.IssueID, "gid-1")
+	}
+	if capturedEvent.HeadSHA != "abc123" {
+		t.Errorf("HeadSHA = %q, want %q", capturedEvent.HeadSHA, "abc123")
+	}
+	if capturedEvent.BranchName != "pilot/ASANA-gid-1" {
+		t.Errorf("BranchName = %q, want %q", capturedEvent.BranchName, "pilot/ASANA-gid-1")
+	}
+}
+
+func TestPoller_OnPRCreated_NotCalledOnFailure(t *testing.T) {
+	client := NewClient(testutil.FakeAsanaToken, testutil.FakeAsanaWorkspaceID)
+	config := &Config{TriggerLabel: "pilot"}
+
+	var prCallbackCalled int
+	var mu sync.Mutex
+
+	poller := NewPoller(client, config, 30*time.Second,
+		WithOnAsanaTask(func(ctx context.Context, task *Task) (*TaskResult, error) {
+			return nil, fmt.Errorf("processing failed")
+		}),
+		WithOnPRCreated(func(ev core.PRCreatedEvent) {
+			mu.Lock()
+			defer mu.Unlock()
+			prCallbackCalled++
+		}),
+	)
+
+	task := &Task{GID: "gid-1", Name: "Test Task"}
+
+	poller.semaphore <- struct{}{}
+	poller.wgMu.Lock()
+	poller.activeWg.Add(1)
+	poller.wgMu.Unlock()
+	go poller.processTaskAsync(context.Background(), task)
+	poller.WaitForActive()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if prCallbackCalled != 0 {
+		t.Errorf("OnPRCreated called %d times on failure, want 0", prCallbackCalled)
 	}
 }
 
