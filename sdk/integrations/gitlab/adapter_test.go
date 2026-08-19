@@ -66,6 +66,48 @@ func TestAdapter_NewPoller_ReturnsPoller(t *testing.T) {
 	}
 }
 
+func TestAdapter_NewPoller_BridgesOnPRCreated(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Token = "fake-token"
+	cfg.Project = "namespace/project"
+
+	a := New(cfg)
+
+	var capturedEvent core.PRCreatedEvent
+	var called int
+
+	deps := core.PollerDeps{
+		Handler: core.IssueHandlerFunc(func(_ context.Context, _ core.IssueEvent) (*core.IssueResult, error) {
+			return nil, nil
+		}),
+		OnPRCreated: func(ev core.PRCreatedEvent) {
+			called++
+			capturedEvent = ev
+		},
+	}
+
+	poller := a.NewPoller(deps)
+	p, ok := poller.(*Poller)
+	if !ok {
+		t.Fatalf("NewPoller returned %T, want *Poller", poller)
+	}
+	if p.OnMRCreated == nil {
+		t.Fatal("expected OnMRCreated to be bridged from PollerDeps.OnPRCreated")
+	}
+
+	p.OnMRCreated(7, "https://example.com/mr/7", 10001, "abc123", "pilot/branch")
+
+	if called != 1 {
+		t.Errorf("OnPRCreated called %d times, want 1", called)
+	}
+	if capturedEvent.PRNumber != 7 {
+		t.Errorf("PRNumber = %d, want 7", capturedEvent.PRNumber)
+	}
+	if capturedEvent.IssueID != "10001" {
+		t.Errorf("IssueID = %q, want %q", capturedEvent.IssueID, "10001")
+	}
+}
+
 func TestToIssueEvent(t *testing.T) {
 	issue := &Issue{
 		IID:         42,
