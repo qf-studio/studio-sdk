@@ -139,3 +139,53 @@ func TestFields_UnmarshalJSON_MixedDescriptionShapes(t *testing.T) {
 		})
 	}
 }
+
+// TestComment_UnmarshalJSON_MixedBodyShapes verifies that Comment (which
+// embeds ADFText for Body) correctly parses both plain-string (Server/DC)
+// and ADF-object (Cloud v3 AddComment/GetComments) body payloads. Before
+// Comment.Body was ADFText, unmarshaling a Cloud response into a plain
+// string field rejected the entire AddComment response with:
+//
+//	json: cannot unmarshal object into Go struct field Comment.body of type string
+//
+// even though the comment had already been posted successfully (see
+// GH-121, same class as GH-119 / pilot#4929).
+func TestComment_UnmarshalJSON_MixedBodyShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		json string
+		want ADFText
+	}{
+		{
+			name: "plain string body (Server/DC)",
+			json: `{"id":"10001","body":"Test comment"}`,
+			want: "Test comment",
+		},
+		{
+			name: "ADF object body (Cloud v3)",
+			json: `{
+				"id": "10047",
+				"body": {
+					"type": "doc",
+					"version": 1,
+					"content": [
+						{"type": "paragraph", "content": [{"type": "text", "text": "Pilot started working on this issue"}]}
+					]
+				}
+			}`,
+			want: "Pilot started working on this issue",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c Comment
+			if err := json.Unmarshal([]byte(tt.json), &c); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if c.Body != tt.want {
+				t.Errorf("Body = %q, want %q", c.Body, tt.want)
+			}
+		})
+	}
+}
