@@ -32,14 +32,15 @@ type IssueResult struct {
 
 // Poller polls Jira for issues with the pilot label.
 type Poller struct {
-	client     *Client
-	config     *Config
-	interval   time.Duration
-	processed  map[string]bool
-	mu         sync.RWMutex
-	onIssue    func(ctx context.Context, issue *Issue) (*IssueResult, error)
-	logger     *slog.Logger
-	pilotLabel string
+	client      *Client
+	config      *Config
+	interval    time.Duration
+	processed   map[string]bool
+	mu          sync.RWMutex
+	onIssue     func(ctx context.Context, issue *Issue) (*IssueResult, error)
+	onPRCreated func(ev core.PRCreatedEvent)
+	logger      *slog.Logger
+	pilotLabel  string
 
 	processedStore core.ProcessedStore
 
@@ -81,6 +82,13 @@ func WithMaxConcurrent(n int) PollerOption {
 			n = 1
 		}
 		p.maxConcurrent = n
+	}
+}
+
+// WithOnPRCreated sets the callback for when a PR is created for an issue.
+func WithOnPRCreated(fn func(ev core.PRCreatedEvent)) PollerOption {
+	return func(p *Poller) {
+		p.onPRCreated = fn
 	}
 }
 
@@ -301,6 +309,16 @@ func (p *Poller) processIssueAsync(ctx context.Context, issue *Issue) {
 
 	if result != nil && result.Success {
 		_ = p.client.AddLabel(ctx, issue.Key, LabelDone)
+	}
+
+	if result != nil && result.PRNumber > 0 && p.onPRCreated != nil {
+		p.onPRCreated(core.PRCreatedEvent{
+			PRNumber:   result.PRNumber,
+			PRURL:      result.PRURL,
+			IssueID:    issue.ID,
+			HeadSHA:    result.HeadSHA,
+			BranchName: result.BranchName,
+		})
 	}
 }
 

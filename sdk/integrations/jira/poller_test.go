@@ -3,6 +3,7 @@ package jira
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/qf-studio/studio-sdk/sdk/core"
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
 )
 
@@ -395,5 +397,84 @@ func TestPoller_SanitizeCalledInLivePath(t *testing.T) {
 	}
 	if capturedTitle == "" {
 		t.Error("capturedTitle is empty — handler was not called")
+	}
+}
+
+func TestPoller_OnPRCreated(t *testing.T) {
+	config := &Config{TriggerLabel: "pilot"}
+	client := NewClient("https://example.atlassian.net", testutil.FakeJiraUsername, testutil.FakeJiraAPIToken, PlatformCloud)
+
+	var prCallbackCalled int
+	var capturedEvent core.PRCreatedEvent
+
+	poller := NewPoller(client, config, 30*time.Second,
+		WithOnJiraIssue(func(ctx context.Context, issue *Issue) (*IssueResult, error) {
+			return &IssueResult{
+				Success:    true,
+				PRNumber:   42,
+				PRURL:      "https://github.com/org/repo/pull/42",
+				HeadSHA:    "abc123",
+				BranchName: "pilot/TEST-99",
+			}, nil
+		}),
+		WithOnPRCreated(func(ev core.PRCreatedEvent) {
+			prCallbackCalled++
+			capturedEvent = ev
+		}),
+	)
+
+	issue := &Issue{ID: "10001", Key: "TEST-99", Fields: Fields{Summary: "Test Issue", Labels: []string{"pilot"}}}
+
+	ctx := context.Background()
+	poller.semaphore <- struct{}{}
+	poller.activeWg.Add(1)
+	go poller.processIssueAsync(ctx, issue)
+	poller.activeWg.Wait()
+
+	if prCallbackCalled != 1 {
+		t.Errorf("OnPRCreated called %d times, want 1", prCallbackCalled)
+	}
+	if capturedEvent.PRNumber != 42 {
+		t.Errorf("PRNumber = %d, want 42", capturedEvent.PRNumber)
+	}
+	if capturedEvent.PRURL != "https://github.com/org/repo/pull/42" {
+		t.Errorf("PRURL = %q, want %q", capturedEvent.PRURL, "https://github.com/org/repo/pull/42")
+	}
+	if capturedEvent.IssueID != "10001" {
+		t.Errorf("IssueID = %q, want %q", capturedEvent.IssueID, "10001")
+	}
+	if capturedEvent.HeadSHA != "abc123" {
+		t.Errorf("HeadSHA = %q, want %q", capturedEvent.HeadSHA, "abc123")
+	}
+	if capturedEvent.BranchName != "pilot/TEST-99" {
+		t.Errorf("BranchName = %q, want %q", capturedEvent.BranchName, "pilot/TEST-99")
+	}
+}
+
+func TestPoller_OnPRCreated_NotCalledOnFailure(t *testing.T) {
+	config := &Config{TriggerLabel: "pilot"}
+	client := NewClient("https://example.atlassian.net", testutil.FakeJiraUsername, testutil.FakeJiraAPIToken, PlatformCloud)
+
+	var prCallbackCalled int
+
+	poller := NewPoller(client, config, 30*time.Second,
+		WithOnJiraIssue(func(ctx context.Context, issue *Issue) (*IssueResult, error) {
+			return nil, fmt.Errorf("processing failed")
+		}),
+		WithOnPRCreated(func(ev core.PRCreatedEvent) {
+			prCallbackCalled++
+		}),
+	)
+
+	issue := &Issue{ID: "10001", Key: "TEST-99", Fields: Fields{Summary: "Test Issue", Labels: []string{"pilot"}}}
+
+	ctx := context.Background()
+	poller.semaphore <- struct{}{}
+	poller.activeWg.Add(1)
+	go poller.processIssueAsync(ctx, issue)
+	poller.activeWg.Wait()
+
+	if prCallbackCalled != 0 {
+		t.Errorf("OnPRCreated called %d times on failure, want 0", prCallbackCalled)
 	}
 }

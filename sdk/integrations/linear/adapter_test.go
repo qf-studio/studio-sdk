@@ -164,6 +164,57 @@ func TestAdapter_NewPoller_WithWorkspace(t *testing.T) {
 	}
 }
 
+// TestAdapter_NewPoller_BridgesOnPRCreated verifies PollerDeps.OnPRCreated is
+// bridged into the Linear-specific Poller's OnPRCreated callback.
+func TestAdapter_NewPoller_BridgesOnPRCreated(t *testing.T) {
+	cfg := &Config{
+		Enabled: true,
+		Workspaces: []*WorkspaceConfig{
+			{
+				Name:         "test",
+				APIKey:       testutil.FakeLinearToken,
+				TeamID:       "TEAM1",
+				TriggerLabel: "pilot",
+			},
+		},
+	}
+	a := New(cfg)
+
+	var capturedEvent core.PRCreatedEvent
+	var called int
+
+	deps := core.PollerDeps{
+		Handler: core.IssueHandlerFunc(func(_ context.Context, _ core.IssueEvent) (*core.IssueResult, error) {
+			return nil, nil
+		}),
+		OnPRCreated: func(ev core.PRCreatedEvent) {
+			called++
+			capturedEvent = ev
+		},
+	}
+
+	poller := a.NewPoller(deps)
+	p, ok := poller.(*Poller)
+	if !ok {
+		t.Fatalf("NewPoller returned %T, want *Poller", poller)
+	}
+	if p.OnPRCreated == nil {
+		t.Fatal("expected OnPRCreated to be bridged from PollerDeps.OnPRCreated")
+	}
+
+	p.OnPRCreated(7, "https://example.com/pr/7", 0, "abc123", "pilot/branch", "issue-node-10001")
+
+	if called != 1 {
+		t.Errorf("OnPRCreated called %d times, want 1", called)
+	}
+	if capturedEvent.PRNumber != 7 {
+		t.Errorf("PRNumber = %d, want 7", capturedEvent.PRNumber)
+	}
+	if capturedEvent.IssueID != "issue-node-10001" {
+		t.Errorf("IssueID = %q, want %q", capturedEvent.IssueID, "issue-node-10001")
+	}
+}
+
 // TestPoller_SanitizeCalledInLivePath is the ASCII-smuggling guard.
 // Invisible Unicode injected into issue Title/Description must be stripped
 // before reaching the IssueHandler callback.
