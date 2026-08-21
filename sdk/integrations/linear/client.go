@@ -546,34 +546,51 @@ func (c *Client) GetLabelByName(ctx context.Context, teamID, labelName string) (
 	return result.IssueLabels.Nodes[0].ID, nil
 }
 
-// getWorkspaceLabelByName finds a label with no owning team — Linear creates
-// labels workspace-scoped by default from the issue view, and those never
-// match GetLabelByName's team-filtered query.
-func (c *Client) getWorkspaceLabelByName(ctx context.Context, teamID, labelName string) (string, error) {
+// labelByName is the raw GraphQL shape for a label matched by name,
+// independent of team. It carries full team details (id, name, key) so
+// callers can tell "workspace-scoped" (Team == nil), "owned by this team",
+// and "owned by another team" apart — a superset of what getWorkspaceLabelByName
+// needs, shared with ClassifyLabel so the two don't each define their own
+// version of the same query.
+type labelByName struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Team *Team  `json:"team"`
+}
+
+// findLabelsByName fetches every label in the workspace matching labelName,
+// regardless of team — the query getWorkspaceLabelByName's fallback and
+// ClassifyLabel's full-workspace scan both need.
+func (c *Client) findLabelsByName(ctx context.Context, labelName string) ([]labelByName, error) {
 	query := `
 		query GetWorkspaceLabel($name: String!) {
 			issueLabels(filter: { name: { eq: $name } }) {
-				nodes { id name team { id } }
+				nodes { id name team { id name key } }
 			}
 		}
 	`
 	var result struct {
 		IssueLabels struct {
-			Nodes []struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
-				Team *struct {
-					ID string `json:"id"`
-				} `json:"team"`
-			} `json:"nodes"`
+			Nodes []labelByName `json:"nodes"`
 		} `json:"issueLabels"`
 	}
 
 	if err := c.Execute(ctx, query, map[string]interface{}{"name": labelName}, &result); err != nil {
+		return nil, err
+	}
+	return result.IssueLabels.Nodes, nil
+}
+
+// getWorkspaceLabelByName finds a label with no owning team — Linear creates
+// labels workspace-scoped by default from the issue view, and those never
+// match GetLabelByName's team-filtered query.
+func (c *Client) getWorkspaceLabelByName(ctx context.Context, teamID, labelName string) (string, error) {
+	nodes, err := c.findLabelsByName(ctx, labelName)
+	if err != nil {
 		return "", err
 	}
 
-	for _, node := range result.IssueLabels.Nodes {
+	for _, node := range nodes {
 		if node.Team == nil {
 			return node.ID, nil
 		}

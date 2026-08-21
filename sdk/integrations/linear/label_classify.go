@@ -35,45 +35,24 @@ type LabelClassificationResult struct {
 	Remedy         string
 }
 
-// classifiedLabelNode is the raw GraphQL shape for a label matched by name,
-// independent of team — unlike GetLabelByName's team-filtered query, this
-// returns every label sharing the name so ClassifyLabel can tell "owned by
-// this team" apart from "owned by a different team".
-type classifiedLabelNode struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Team *Team  `json:"team"`
-}
-
 // ClassifyLabel determines how a label named labelName resolves against
 // teamRef (a team key or UUID), across all scopes in the workspace — not
-// just the team-filtered match GetLabelByName performs. It routes through
-// Client.Execute, the same GraphQL client the poller uses, so the
-// classification reflects the real production lookup path.
+// just the team-filtered match GetLabelByName performs. It reuses
+// findLabelsByName, the same all-scopes lookup that backs GetLabelByName's
+// workspace fallback, so the classification reflects the real production
+// lookup path without maintaining a second copy of that query.
 //
 // This is a diagnostic helper: it does not create, delete, or move labels.
 func (c *Client) ClassifyLabel(ctx context.Context, teamRef, labelName string) (*LabelClassificationResult, error) {
-	query := `
-		query ClassifyLabel($name: String!) {
-			issueLabels(filter: { name: { eq: $name } }) {
-				nodes { id name team { id name key } }
-			}
-		}
-	`
-	var result struct {
-		IssueLabels struct {
-			Nodes []classifiedLabelNode `json:"nodes"`
-		} `json:"issueLabels"`
-	}
-
-	if err := c.Execute(ctx, query, map[string]interface{}{"name": labelName}, &result); err != nil {
+	nodes, err := c.findLabelsByName(ctx, labelName)
+	if err != nil {
 		return nil, err
 	}
 
-	var otherTeamNode *classifiedLabelNode
+	var otherTeamNode *labelByName
 
-	for i := range result.IssueLabels.Nodes {
-		node := &result.IssueLabels.Nodes[i]
+	for i := range nodes {
+		node := &nodes[i]
 
 		if node.Team == nil {
 			return &LabelClassificationResult{
