@@ -18,6 +18,14 @@ import (
 // when it filters on team.key — so the fixture actually exercises GH-133:
 // ClassifyLabel and GetLabelByName must agree on which filter field a given
 // teamRef dispatches to, or one silently misses what the other finds.
+//
+// The key-filter branch also honors which StringComparator operator the
+// query actually used: eqIgnoreCase matches case-insensitively (mirroring
+// real Linear semantics), eq matches exactly. This is what lets
+// TestClassifyLabelAndGetLabelByName_AgreeOnMiscasedKeyTeamRef catch GH-135 —
+// before that fix GetLabelByName's query used eq, so a miscased teamRef
+// silently missed here even though ClassifyLabel's EqualFold-based
+// teamRefMatches found it.
 func teamRefFixtureServer(t *testing.T, nodes []labelByName) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -40,6 +48,7 @@ func teamRefFixtureServer(t *testing.T, nodes []labelByName) *httptest.Server {
 
 		teamID, _ := req.Variables["teamId"].(string)
 		byID := strings.Contains(req.Query, "team: { id:")
+		keyIgnoresCase := strings.Contains(req.Query, "key: { eqIgnoreCase:")
 
 		var matched []labelByName
 		for _, n := range nodes {
@@ -48,9 +57,14 @@ func teamRefFixtureServer(t *testing.T, nodes []labelByName) *httptest.Server {
 			}
 			if byID && n.Team.ID == teamID {
 				matched = append(matched, n)
+				continue
 			}
-			if !byID && n.Team.Key == teamID {
-				matched = append(matched, n)
+			if !byID {
+				if keyIgnoresCase && strings.EqualFold(n.Team.Key, teamID) {
+					matched = append(matched, n)
+				} else if !keyIgnoresCase && n.Team.Key == teamID {
+					matched = append(matched, n)
+				}
 			}
 		}
 		body, err := json.Marshal(matched)
@@ -91,6 +105,44 @@ func TestClassifyLabelAndGetLabelByName_AgreeOnUUIDTeamRef(t *testing.T) {
 	id, err := client.GetLabelByName(context.Background(), teamUUID, "pilot")
 	if err != nil {
 		t.Fatalf("GetLabelByName: %v (GH-133: UUID teamRef must filter by team id, not key)", err)
+	}
+	if id != "label-1" {
+		t.Errorf("GetLabelByName id = %q, want label-1", id)
+	}
+}
+
+// TestClassifyLabelAndGetLabelByName_AgreeOnMiscasedKeyTeamRef pins the
+// GH-135 fix: a miscased teamRef ("rou" against a team keyed "ROU") must
+// resolve team_scoped via ClassifyLabel AND succeed via GetLabelByName, from
+// the same fixture used by the GH-133 UUID test. Before the fix,
+// GetLabelByName's key filter used Linear's case-sensitive eq operator while
+// ClassifyLabel's teamRefMatches compared with strings.EqualFold — so
+// preflight reported team_scoped (fine) while GetLabelByName's key filter
+// missed, the workspace fallback missed too (this label has an owning team),
+// and startup died on a label ClassifyLabel had just cleared.
+func TestClassifyLabelAndGetLabelByName_AgreeOnMiscasedKeyTeamRef(t *testing.T) {
+	nodes := []labelByName{
+		{ID: "label-1", Name: "pilot", Team: &Team{ID: "team-rou", Key: "ROU", Name: "Routing"}},
+	}
+
+	server := teamRefFixtureServer(t, nodes)
+	defer server.Close()
+
+	client := NewClientWithBaseURL(testutil.FakeLinearToken, server.URL)
+
+	const teamRef = "rou"
+
+	result, err := client.ClassifyLabel(context.Background(), teamRef, "pilot")
+	if err != nil {
+		t.Fatalf("ClassifyLabel: %v", err)
+	}
+	if result.Classification != LabelTeamScoped {
+		t.Errorf("ClassifyLabel Classification = %v, want %v", result.Classification, LabelTeamScoped)
+	}
+
+	id, err := client.GetLabelByName(context.Background(), teamRef, "pilot")
+	if err != nil {
+		t.Fatalf("GetLabelByName: %v (GH-135: miscased key teamRef must match case-insensitively, same as ClassifyLabel)", err)
 	}
 	if id != "label-1" {
 		t.Errorf("GetLabelByName id = %q, want label-1", id)

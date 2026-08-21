@@ -45,7 +45,11 @@ type LabelClassificationResult struct {
 // do for the same teamRef. Key comparison is case-insensitive: Linear team
 // keys are conventionally upper-case, but nothing enforces that in operator
 // config, and a case mismatch there must not be misreported as
-// LabelAnotherTeam.
+// LabelAnotherTeam. GetLabelByName's key filter uses Linear's eqIgnoreCase
+// StringComparator operator (not eq, which is case-sensitive) so its GraphQL
+// query actually matches case-insensitively too — otherwise this function's
+// "always matches what GetLabelByName will actually do" claim would be false
+// for any miscased teamRef (GH-135).
 func teamRefMatches(team *Team, teamRef string) bool {
 	if team == nil {
 		return false
