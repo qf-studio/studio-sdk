@@ -514,15 +514,25 @@ func (c *Client) RemoveLabel(ctx context.Context, issueID, labelID string) error
 	}, nil)
 }
 
-// GetLabelByName fetches a label ID by name for a team.
+// GetLabelByName fetches a label ID by name for a team. teamID may be a team
+// key (e.g. "ENG") or a team UUID — the filter field is chosen accordingly so
+// a UUID teamID matches the team by id instead of being (silently) compared
+// against key, which never matches and previously caused a false "not found"
+// for team-scoped labels whenever a caller configured teamID as a UUID. This
+// dispatch mirrors ClassifyLabel's teamRefMatches, so the two agree on what
+// "scoped to teamID" means for the same input.
 func (c *Client) GetLabelByName(ctx context.Context, teamID, labelName string) (string, error) {
-	query := `
+	filterField := "key"
+	if looksLikeUUID(teamID) {
+		filterField = "id"
+	}
+	query := fmt.Sprintf(`
 		query GetLabel($teamId: String!, $name: String!) {
-			issueLabels(filter: { team: { key: { eq: $teamId } }, name: { eq: $name } }) {
+			issueLabels(filter: { team: { %s: { eq: $teamId } }, name: { eq: $name } }) {
 				nodes { id name }
 			}
 		}
-	`
+	`, filterField)
 	var result struct {
 		IssueLabels struct {
 			Nodes []struct {
