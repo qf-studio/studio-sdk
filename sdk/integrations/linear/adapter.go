@@ -13,6 +13,8 @@ package linear
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/core"
@@ -45,18 +47,33 @@ func (a *Adapter) WebhookSource() string { return "linear" }
 // NewPoller creates a core.Poller backed by the Linear polling mechanism.
 // It bridges core.PollerDeps (IssueHandler, ProcessedStore, OnPRCreated) into
 // the Linear-specific Poller, converting *Issue ↔ core.IssueEvent at the boundary.
+// Every configured workspace gets its own polling loop.
 func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	workspaces := a.config.GetWorkspaces()
 	if len(workspaces) == 0 {
 		return &nopPoller{}
 	}
 
-	ws := workspaces[0]
+	if len(workspaces) == 1 {
+		return a.newWorkspacePoller(workspaces[0], deps)
+	}
+
+	pollers := make([]core.Poller, 0, len(workspaces))
+	for _, ws := range workspaces {
+		pollers = append(pollers, a.newWorkspacePoller(ws, deps))
+	}
+	return &multiPoller{pollers: pollers}
+}
+
+func (a *Adapter) newWorkspacePoller(ws *WorkspaceConfig, deps core.PollerDeps) core.Poller {
 	client := NewClient(ws.APIKey)
 
 	interval := 30 * time.Second
 	if a.config.Polling != nil && a.config.Polling.Interval > 0 {
 		interval = a.config.Polling.Interval
+	}
+	if ws.Polling != nil && ws.Polling.Interval > 0 {
+		interval = ws.Polling.Interval
 	}
 
 	opts := []PollerOption{
@@ -126,3 +143,22 @@ func toIssueEvent(issue *Issue) core.IssueEvent {
 type nopPoller struct{}
 
 func (n *nopPoller) Start(_ context.Context) error { return nil }
+
+// multiPoller runs one poller per workspace; a failing workspace must not stop the others.
+type multiPoller struct {
+	pollers []core.Poller
+}
+
+func (m *multiPoller) Start(ctx context.Context) error {
+	var wg sync.WaitGroup
+	errs := make([]error, len(m.pollers))
+	for i, p := range m.pollers {
+		wg.Add(1)
+		go func(i int, p core.Poller) {
+			defer wg.Done()
+			errs[i] = p.Start(ctx)
+		}(i, p)
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}

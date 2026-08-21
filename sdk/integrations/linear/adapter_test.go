@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/core"
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
@@ -260,5 +261,104 @@ func TestPoller_SanitizeCalledInLivePath(t *testing.T) {
 	}
 	if capturedTitle == "" {
 		t.Error("capturedTitle is empty — handler was not called")
+	}
+}
+
+func TestAdapter_NewPoller_AllWorkspaces(t *testing.T) {
+	cfg := &Config{
+		Enabled: true,
+		Polling: &PollingConfig{Enabled: true, Interval: 45 * time.Second},
+		Workspaces: []*WorkspaceConfig{
+			{Name: "one", APIKey: testutil.FakeLinearToken, TeamID: "OMN", TriggerLabel: "pilot"},
+			{
+				Name: "two", APIKey: testutil.FakeLinearToken, TeamID: "ROU", TriggerLabel: "llm-pilot",
+				Polling: &PollingConfig{Enabled: true, Interval: 90 * time.Second},
+			},
+		},
+	}
+	a := New(cfg)
+
+	deps := core.PollerDeps{
+		Handler: core.IssueHandlerFunc(func(ctx context.Context, ev core.IssueEvent) (*core.IssueResult, error) {
+			return nil, nil
+		}),
+	}
+
+	poller := a.NewPoller(deps)
+	mp, ok := poller.(*multiPoller)
+	if !ok {
+		t.Fatalf("NewPoller returned %T, want *multiPoller for 2 workspaces", poller)
+	}
+	if len(mp.pollers) != 2 {
+		t.Fatalf("multiPoller holds %d pollers, want 2", len(mp.pollers))
+	}
+
+	first, ok := mp.pollers[0].(*Poller)
+	if !ok {
+		t.Fatalf("pollers[0] is %T, want *Poller", mp.pollers[0])
+	}
+	second, ok := mp.pollers[1].(*Poller)
+	if !ok {
+		t.Fatalf("pollers[1] is %T, want *Poller", mp.pollers[1])
+	}
+
+	if first.config.TeamID != "OMN" || second.config.TeamID != "ROU" {
+		t.Errorf("poller teams = %q, %q; want OMN, ROU", first.config.TeamID, second.config.TeamID)
+	}
+	if first.interval != 45*time.Second {
+		t.Errorf("first interval = %v, want the global 45s", first.interval)
+	}
+	if second.interval != 90*time.Second {
+		t.Errorf("second interval = %v, want the workspace override 90s", second.interval)
+	}
+}
+
+func TestMultiPoller_StartRunsAllAndJoinsErrors(t *testing.T) {
+	started := make(chan string, 2)
+	mp := &multiPoller{pollers: []core.Poller{
+		pollerFunc(func(ctx context.Context) error { started <- "a"; return nil }),
+		pollerFunc(func(ctx context.Context) error { started <- "b"; return context.DeadlineExceeded }),
+	}}
+
+	err := mp.Start(context.Background())
+	if len(started) != 2 {
+		t.Fatalf("started %d pollers, want 2", len(started))
+	}
+	if err == nil || !strings.Contains(err.Error(), context.DeadlineExceeded.Error()) {
+		t.Errorf("joined error = %v, want to contain %v", err, context.DeadlineExceeded)
+	}
+}
+
+type pollerFunc func(ctx context.Context) error
+
+func (f pollerFunc) Start(ctx context.Context) error { return f(ctx) }
+
+func TestAdapter_NewPoller_SingleWorkspaceDirect(t *testing.T) {
+	cfg := &Config{
+		Enabled: true,
+		Polling: &PollingConfig{Enabled: true, Interval: 45 * time.Second},
+		Workspaces: []*WorkspaceConfig{
+			{
+				Name: "solo", APIKey: testutil.FakeLinearToken, TeamID: "OMN", TriggerLabel: "pilot",
+				Polling: &PollingConfig{Enabled: true, Interval: 90 * time.Second},
+			},
+		},
+	}
+	deps := core.PollerDeps{
+		Handler: core.IssueHandlerFunc(func(ctx context.Context, ev core.IssueEvent) (*core.IssueResult, error) {
+			return nil, nil
+		}),
+	}
+
+	poller := New(cfg).NewPoller(deps)
+	p, ok := poller.(*Poller)
+	if !ok {
+		t.Fatalf("NewPoller returned %T, want bare *Poller for a single workspace", poller)
+	}
+	if p.config.TeamID != "OMN" {
+		t.Errorf("team = %q, want OMN", p.config.TeamID)
+	}
+	if p.interval != 90*time.Second {
+		t.Errorf("interval = %v, want the workspace override 90s", p.interval)
 	}
 }
