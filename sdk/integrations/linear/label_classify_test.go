@@ -11,8 +11,9 @@ import (
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
 )
 
-// classifyLabelServer returns a fake GraphQL server that answers a
-// ClassifyLabel query with the given nodes JSON, following the
+// classifyLabelServer returns a fake GraphQL server that answers
+// ClassifyLabel's underlying query — the shared GetWorkspaceLabel lookup
+// findLabelsByName also uses — with the given nodes JSON, following the
 // label_lookup_test.go idiom of decoding the real GraphQLRequest and
 // replying with a GraphQLResponse envelope.
 func classifyLabelServer(t *testing.T, nodes string) *httptest.Server {
@@ -22,7 +23,7 @@ func classifyLabelServer(t *testing.T, nodes string) *httptest.Server {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
-		if !strings.Contains(req.Query, "ClassifyLabel") {
+		if !strings.Contains(req.Query, "GetWorkspaceLabel") {
 			t.Fatalf("unexpected query: %s", req.Query)
 		}
 		w.Header().Set("Content-Type", "application/json")
