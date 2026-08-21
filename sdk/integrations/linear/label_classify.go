@@ -3,6 +3,7 @@ package linear
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // LabelClassification describes how a label name resolves relative to a
@@ -35,12 +36,42 @@ type LabelClassificationResult struct {
 	Remedy         string
 }
 
+// teamRefMatches reports whether team is the team identified by teamRef,
+// which may be either a team key (e.g. "ENG") or a team UUID — the same two
+// forms GetLabelByName's teamID parameter accepts. This mirrors
+// GetLabelByName's own dispatch: a UUID-shaped teamRef is compared only
+// against the team's ID, a non-UUID teamRef only against its key, so
+// ClassifyLabel's verdict always matches what GetLabelByName will actually
+// do for the same teamRef. Key comparison is case-insensitive: Linear team
+// keys are conventionally upper-case, but nothing enforces that in operator
+// config, and a case mismatch there must not be misreported as
+// LabelAnotherTeam.
+func teamRefMatches(team *Team, teamRef string) bool {
+	if team == nil {
+		return false
+	}
+	if looksLikeUUID(teamRef) {
+		return team.ID == teamRef
+	}
+	return strings.EqualFold(team.Key, teamRef)
+}
+
 // ClassifyLabel determines how a label named labelName resolves against
 // teamRef (a team key or UUID), across all scopes in the workspace — not
 // just the team-filtered match GetLabelByName performs. It reuses
 // findLabelsByName, the same all-scopes lookup that backs GetLabelByName's
 // workspace fallback, so the classification reflects the real production
 // lookup path without maintaining a second copy of that query.
+//
+// Precedence decision: a team-scoped match for teamRef always wins over a
+// workspace-scoped node, even when the workspace-scoped node appears earlier
+// in the result set. This mirrors GetLabelByName's real lookup order — it
+// tries the team-filtered query first and only falls back to the
+// workspace-scoped query when that comes back empty — so a label that
+// GetLabelByName would resolve via the team filter is never misclassified as
+// LabelWorkspaceScoped just because of API result ordering. Only when no
+// team-scoped match exists does a workspace-scoped node (checked next) or
+// another team's node (checked last) get reported.
 //
 // This is a diagnostic helper: it does not create, delete, or move labels.
 func (c *Client) ClassifyLabel(ctx context.Context, teamRef, labelName string) (*LabelClassificationResult, error) {
@@ -49,23 +80,13 @@ func (c *Client) ClassifyLabel(ctx context.Context, teamRef, labelName string) (
 		return nil, err
 	}
 
+	var workspaceNode *labelByName
 	var otherTeamNode *labelByName
 
 	for i := range nodes {
 		node := &nodes[i]
 
-		if node.Team == nil {
-			return &LabelClassificationResult{
-				Classification: LabelWorkspaceScoped,
-				LabelID:        node.ID,
-				Remedy: fmt.Sprintf(
-					"label %q is workspace-scoped (scope is immutable in Linear) — delete & recreate team-scoped under %s",
-					labelName, teamRef,
-				),
-			}, nil
-		}
-
-		if node.Team.ID == teamRef || node.Team.Key == teamRef {
+		if teamRefMatches(node.Team, teamRef) {
 			return &LabelClassificationResult{
 				Classification: LabelTeamScoped,
 				LabelID:        node.ID,
@@ -74,9 +95,27 @@ func (c *Client) ClassifyLabel(ctx context.Context, teamRef, labelName string) (
 			}, nil
 		}
 
+		if node.Team == nil {
+			if workspaceNode == nil {
+				workspaceNode = node
+			}
+			continue
+		}
+
 		if otherTeamNode == nil {
 			otherTeamNode = node
 		}
+	}
+
+	if workspaceNode != nil {
+		return &LabelClassificationResult{
+			Classification: LabelWorkspaceScoped,
+			LabelID:        workspaceNode.ID,
+			Remedy: fmt.Sprintf(
+				"label %q is workspace-scoped (scope is immutable in Linear) — delete & recreate team-scoped under %s",
+				labelName, teamRef,
+			),
+		}, nil
 	}
 
 	if otherTeamNode != nil {
