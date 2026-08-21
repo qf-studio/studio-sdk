@@ -520,19 +520,26 @@ func (c *Client) RemoveLabel(ctx context.Context, issueID, labelID string) error
 // against key, which never matches and previously caused a false "not found"
 // for team-scoped labels whenever a caller configured teamID as a UUID. This
 // dispatch mirrors ClassifyLabel's teamRefMatches, so the two agree on what
-// "scoped to teamID" means for the same input.
+// "scoped to teamID" means for the same input. The key filter uses
+// eqIgnoreCase rather than eq: Linear's StringComparator treats eq as
+// case-sensitive, and teamRefMatches compares keys with strings.EqualFold, so
+// a plain eq here would silently diverge from ClassifyLabel for any caller
+// whose configured team key doesn't match Linear's stored casing exactly
+// (GH-135).
 func (c *Client) GetLabelByName(ctx context.Context, teamID, labelName string) (string, error) {
 	filterField := "key"
+	operator := "eqIgnoreCase"
 	if looksLikeUUID(teamID) {
 		filterField = "id"
+		operator = "eq"
 	}
 	query := fmt.Sprintf(`
 		query GetLabel($teamId: String!, $name: String!) {
-			issueLabels(filter: { team: { %s: { eq: $teamId } }, name: { eq: $name } }) {
+			issueLabels(filter: { team: { %s: { %s: $teamId } }, name: { eq: $name } }) {
 				nodes { id name }
 			}
 		}
-	`, filterField)
+	`, filterField, operator)
 	var result struct {
 		IssueLabels struct {
 			Nodes []struct {
