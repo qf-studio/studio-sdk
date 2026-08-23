@@ -120,6 +120,9 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	if deps.MaxConcurrent > 0 {
 		opts = append(opts, WithMaxConcurrent(deps.MaxConcurrent))
 	}
+	if deps.ExecutionMode != "" {
+		opts = append(opts, WithExecutionMode(ExecutionMode(deps.ExecutionMode)))
+	}
 	if deps.OnPRCreated != nil {
 		fn := deps.OnPRCreated
 		opts = append(opts, WithOnPRCreated(func(prNumber int, prURL string, issueNumber int, headSHA string, branchName string, issueNodeID string) {
