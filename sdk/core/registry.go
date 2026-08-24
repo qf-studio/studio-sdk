@@ -225,6 +225,11 @@ type PollerDeps struct {
 	// MaxConcurrent caps concurrent issue handling. Zero means the
 	// adapter's own default.
 	MaxConcurrent int
+	// ExecutionMode selects how the adapter dispatches discovered issues:
+	// "sequential" (one at a time, waiting for PR/MR merge), "parallel", or
+	// "auto" where supported. Empty means the adapter's own default. Adapters
+	// whose poller does not implement sequential execution ignore this field.
+	ExecutionMode string
 	// Handler processes each discovered issue.
 	Handler IssueHandler
 	// OnPRCreated fires after an adapter opens a PR/MR for an issue.

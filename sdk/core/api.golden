@@ -195,6 +195,7 @@ type Poller interface {
 type PollerDeps struct {
 	ProcessedStore ProcessedStore
 	MaxConcurrent int
+	ExecutionMode string
 	Handler IssueHandler
 	OnPRCreated func(ev PRCreatedEvent)
 	TaskChecker TaskChecker
