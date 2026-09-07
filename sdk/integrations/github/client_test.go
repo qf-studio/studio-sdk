@@ -2745,7 +2745,7 @@ func TestFindMergedPRByBranch(t *testing.T) {
 			defer server.Close()
 
 			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
-			found, err := client.FindMergedPRByBranch(context.Background(), "owner", "repo", tt.branch)
+			found, _, err := client.FindMergedPRByBranch(context.Background(), "owner", "repo", tt.branch)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("FindMergedPRByBranch() error = %v, wantErr %v", err, tt.wantErr)
 				return
