@@ -1263,11 +1263,12 @@ func (p *Poller) resolveDefaultBranch(ctx context.Context) (branch string, ok bo
 var prTitleIssueRefRe = regexp.MustCompile(`(?i)^\s*GH-(\d+)\s*:`)
 
 // prClosingKeywordRefRe matches a GitHub closing keyword ("closes #275",
-// "fixes: #275", "resolved GH-275") anywhere in a PR body.
-var prClosingKeywordRefRe = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:#|GH-)(\d+)\b`)
-
-// prBareIssueRefRe matches a bare "#275" issue reference anywhere in a PR body.
-var prBareIssueRefRe = regexp.MustCompile(`#(\d+)\b`)
+// "fixes: #275", "resolved GH-275", "closes https://github.com/o/r/issues/275")
+// immediately followed by the issue reference. A bare "#<n>" elsewhere in the
+// body (e.g. an autopilot CI-fix PR's "Original Issue: #275" metadata line,
+// or "Reverts PR #275" / "Refs #275" / "Follow-up to #275") is deliberately
+// NOT matched — only a closing keyword counts as delivery (GH-140).
+var prClosingKeywordRefRe = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:https?://\S*?/issues/|#|GH-)(\d+)\b`)
 
 // titleReferencedIssue extracts the issue number a PR title claims to deliver
 // via the "GH-<n>:" prefix convention, if present.
@@ -1284,11 +1285,15 @@ func titleReferencedIssue(title string) (int, bool) {
 }
 
 // prReferencesIssue reports whether pr identifies issueNumber as the issue it
-// delivers — via a "GH-<n>:" title prefix, a closing keyword referencing the
-// issue in the body, or a bare "#<n>" reference in the body. This guards
-// against a merged PR that reused the same pilot/GH-<n> head branch name for
-// an unrelated issue (GH-138): the branch-lookup fallback must not treat that
-// merge as delivery of this issue.
+// delivers — via a "GH-<n>:" title prefix, or a closing keyword (close/fix/
+// resolve, in their inflections) immediately followed by the issue reference
+// in the body. A bare "#<n>" elsewhere in the body does NOT count: the
+// autopilot CI-fix PR template's "- **Original Issue**: #275" metadata line
+// is not a delivery claim, and neither is "Reverts PR #275", "Refs #275", or
+// "Follow-up to #275" (GH-140, follow-up to the branch-reuse guard added for
+// GH-138: the branch-lookup fallback must not treat a merged PR that reused
+// the same pilot/GH-<n> head branch name for an unrelated issue as delivery
+// of this issue).
 func prReferencesIssue(pr *PullRequest, issueNumber int) bool {
 	if pr == nil {
 		return false
@@ -1297,11 +1302,6 @@ func prReferencesIssue(pr *PullRequest, issueNumber int) bool {
 		return true
 	}
 	for _, m := range prClosingKeywordRefRe.FindAllStringSubmatch(pr.Body, -1) {
-		if n, err := strconv.Atoi(m[1]); err == nil && n == issueNumber {
-			return true
-		}
-	}
-	for _, m := range prBareIssueRefRe.FindAllStringSubmatch(pr.Body, -1) {
 		if n, err := strconv.Atoi(m[1]); err == nil && n == issueNumber {
 			return true
 		}
