@@ -1235,26 +1235,29 @@ func (c *Client) SearchMergedPRsForIssueOnBase(ctx context.Context, owner, repo 
 }
 
 // FindMergedPRByBranch looks up PRs by head branch via the strongly-consistent REST API.
-// Returns true if any PR on that branch is merged.
+// Returns true, and the matched PR (number, title, body), if any PR on that
+// branch is merged. The caller is responsible for verifying the returned PR
+// actually references the issue in question — a head branch name can be
+// reused by an unrelated issue's PR (GH-138).
 //
 // This does not check the merge base: a PR squash-merged into a non-default
 // branch (stacked PR) is indistinguishable from a real delivery here. Prefer
 // FindMergedPRByBranchOnBase when the default branch is known (GH-117).
-func (c *Client) FindMergedPRByBranch(ctx context.Context, owner, repo, branch string) (bool, error) {
+func (c *Client) FindMergedPRByBranch(ctx context.Context, owner, repo, branch string) (bool, *PullRequest, error) {
 	head := fmt.Sprintf("%s:%s", owner, branch)
 	path := fmt.Sprintf("/repos/%s/%s/pulls?head=%s&state=closed&per_page=10",
 		owner, repo, url.QueryEscape(head))
 
 	var prs []*PullRequest
 	if err := c.doRequest(ctx, http.MethodGet, path, nil, &prs); err != nil {
-		return false, fmt.Errorf("list PRs by branch %s: %w", branch, err)
+		return false, nil, fmt.Errorf("list PRs by branch %s: %w", branch, err)
 	}
 	for _, pr := range prs {
 		if pr.MergedAt != "" || pr.Merged {
-			return true, nil
+			return true, pr, nil
 		}
 	}
-	return false, nil
+	return false, nil, nil
 }
 
 // MergedPRBranchResult is the result of a base-aware merged-PR-by-branch lookup.
@@ -1269,6 +1272,10 @@ type MergedPRBranchResult struct {
 	// OtherBase is the base ref of a merged PR found on the branch whose base
 	// did NOT match the default branch. Empty if no such PR was found.
 	OtherBase string
+	// PR is the merged pull request that produced OnDefaultBranch/OtherBase,
+	// populated so the caller can verify it actually references the issue
+	// rather than merely reusing the same head branch name (GH-138).
+	PR *PullRequest
 }
 
 // FindMergedPRByBranchOnBase is the base-aware counterpart to
@@ -1292,10 +1299,12 @@ func (c *Client) FindMergedPRByBranchOnBase(ctx context.Context, owner, repo, br
 		}
 		if pr.Base.Ref == defaultBranch {
 			result.OnDefaultBranch = true
+			result.PR = pr
 			return result, nil
 		}
 		if result.OtherBase == "" {
 			result.OtherBase = pr.Base.Ref
+			result.PR = pr
 		}
 	}
 	return result, nil

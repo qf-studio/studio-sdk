@@ -1258,6 +1258,57 @@ func (p *Poller) resolveDefaultBranch(ctx context.Context) (branch string, ok bo
 	return p.defaultBranch, p.defaultBranchOK
 }
 
+// prTitleIssueRefRe matches a PR title's leading "GH-<n>:" issue prefix, the
+// convention used by pilot-authored PRs (e.g. "GH-275: fix the thing").
+var prTitleIssueRefRe = regexp.MustCompile(`(?i)^\s*GH-(\d+)\s*:`)
+
+// prClosingKeywordRefRe matches a GitHub closing keyword ("closes #275",
+// "fixes: #275", "resolved GH-275") anywhere in a PR body.
+var prClosingKeywordRefRe = regexp.MustCompile(`(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:#|GH-)(\d+)\b`)
+
+// prBareIssueRefRe matches a bare "#275" issue reference anywhere in a PR body.
+var prBareIssueRefRe = regexp.MustCompile(`#(\d+)\b`)
+
+// titleReferencedIssue extracts the issue number a PR title claims to deliver
+// via the "GH-<n>:" prefix convention, if present.
+func titleReferencedIssue(title string) (int, bool) {
+	m := prTitleIssueRefRe.FindStringSubmatch(title)
+	if m == nil {
+		return 0, false
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// prReferencesIssue reports whether pr identifies issueNumber as the issue it
+// delivers — via a "GH-<n>:" title prefix, a closing keyword referencing the
+// issue in the body, or a bare "#<n>" reference in the body. This guards
+// against a merged PR that reused the same pilot/GH-<n> head branch name for
+// an unrelated issue (GH-138): the branch-lookup fallback must not treat that
+// merge as delivery of this issue.
+func prReferencesIssue(pr *PullRequest, issueNumber int) bool {
+	if pr == nil {
+		return false
+	}
+	if n, ok := titleReferencedIssue(pr.Title); ok && n == issueNumber {
+		return true
+	}
+	for _, m := range prClosingKeywordRefRe.FindAllStringSubmatch(pr.Body, -1) {
+		if n, err := strconv.Atoi(m[1]); err == nil && n == issueNumber {
+			return true
+		}
+	}
+	for _, m := range prBareIssueRefRe.FindAllStringSubmatch(pr.Body, -1) {
+		if n, err := strconv.Atoi(m[1]); err == nil && n == issueNumber {
+			return true
+		}
+	}
+	return false
+}
+
 // hasMergedWork checks if the issue already has merged PRs. A PR merged into a
 // non-default base (e.g. a stacked PR squash-merged into its stack parent
 // branch, not main) is not treated as delivery — only a merge onto the repo's
@@ -1294,6 +1345,19 @@ func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
 			}
 			switch {
 			case result.OnDefaultBranch:
+				if !prReferencesIssue(result.PR, issue.Number) {
+					logFields := []any{
+						slog.Int("issue", issue.Number),
+						slog.String("branch", branch),
+						slog.Int("pr", result.PR.Number),
+						slog.String("pr_title", result.PR.Title),
+					}
+					if refIssue, ok := titleReferencedIssue(result.PR.Title); ok {
+						logFields = append(logFields, slog.Int("references_issue", refIssue))
+					}
+					p.logger.Info("Merged PR found via branch lookup but does not reference this issue, not treating as done", logFields...)
+					return false
+				}
 				found = true
 				p.logger.Info("Merged PR found via branch lookup",
 					slog.Int("issue", issue.Number),
@@ -1311,7 +1375,7 @@ func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
 				return false
 			}
 		} else {
-			branchFound, berr := p.client.FindMergedPRByBranch(ctx, p.owner, p.repo, branch)
+			branchFound, branchPR, berr := p.client.FindMergedPRByBranch(ctx, p.owner, p.repo, branch)
 			if berr != nil {
 				p.logger.Warn("Failed to check merged PRs by branch",
 					slog.Int("issue", issue.Number),
@@ -1321,6 +1385,19 @@ func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
 				return false
 			}
 			if !branchFound {
+				return false
+			}
+			if !prReferencesIssue(branchPR, issue.Number) {
+				logFields := []any{
+					slog.Int("issue", issue.Number),
+					slog.String("branch", branch),
+					slog.Int("pr", branchPR.Number),
+					slog.String("pr_title", branchPR.Title),
+				}
+				if refIssue, ok := titleReferencedIssue(branchPR.Title); ok {
+					logFields = append(logFields, slog.Int("references_issue", refIssue))
+				}
+				p.logger.Info("Merged PR found via branch lookup but does not reference this issue, not treating as done", logFields...)
 				return false
 			}
 			found = true

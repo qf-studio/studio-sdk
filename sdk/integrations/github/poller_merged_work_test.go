@@ -126,7 +126,7 @@ func TestHasMergedWork_DefaultBranchMerge_MarksDone(t *testing.T) {
 	ts.repoBody = `{"default_branch":"main"}`
 	ts.searchTotalCount = 0
 	ts.searchWantBase = "main"
-	ts.pullsResponse = `[{"number":200,"merged_at":"2026-08-15T10:00:00Z","base":{"ref":"main"}}]`
+	ts.pullsResponse = `[{"number":200,"title":"GH-117: fix the thing","merged_at":"2026-08-15T10:00:00Z","base":{"ref":"main"}}]`
 
 	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
 	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second)
@@ -140,6 +140,37 @@ func TestHasMergedWork_DefaultBranchMerge_MarksDone(t *testing.T) {
 	}
 	if !ts.hasAddedLabel(LabelDone) {
 		t.Error("expected pilot-done label to be added")
+	}
+}
+
+// TestHasMergedWork_BranchLookup_ReusedByOtherIssue_DoesNotMarkDone is the
+// GH-138 regression case: issue #275's branch pilot/GH-275 was reused by a
+// follow-up issue (#277) whose PR (#278) merged into main. The branch
+// lookup must not treat that unrelated merge as delivery of #275 — it must
+// check that the merged PR actually references #275 (pilot-console incident,
+// 2026-09-07).
+func TestHasMergedWork_BranchLookup_ReusedByOtherIssue_DoesNotMarkDone(t *testing.T) {
+	ts := newMergedWorkTestServer()
+	defer ts.close()
+	ts.repoBody = `{"default_branch":"main"}`
+	ts.searchTotalCount = 0
+	ts.searchWantBase = "main"
+	// Merged PR is on branch pilot/GH-275 (the fixture's lookup branch), but
+	// its title/body reference issue #277, not #275.
+	ts.pullsResponse = `[{"number":278,"title":"GH-277: continue after CI flake","body":"Closes #277","merged_at":"2026-09-07T10:00:00Z","base":{"ref":"main"}}]`
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	issue := &Issue{Number: 275, Title: "original issue", State: "open"}
+	if poller.hasMergedWork(context.Background(), issue) {
+		t.Fatal("expected hasMergedWork = false when the merged PR on the branch references a different issue")
+	}
+	if ts.hasAddedLabel(LabelDone) {
+		t.Error("pilot-done should not be added when the branch's merged PR belongs to a different issue")
 	}
 }
 
