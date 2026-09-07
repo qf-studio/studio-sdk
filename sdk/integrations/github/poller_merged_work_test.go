@@ -174,6 +174,82 @@ func TestHasMergedWork_BranchLookup_ReusedByOtherIssue_DoesNotMarkDone(t *testin
 	}
 }
 
+// TestHasMergedWork_BranchLookup_AutopilotCIFixBody_DoesNotMarkDone is the
+// GH-140 regression case: the real pilot-console PR #278 body (the autopilot
+// CI-fix template) contains a bare "- **Original Issue**: #275" metadata
+// line alongside "Closes #277". prReferencesIssue must not treat the bare
+// #275 mention as delivery of #275 — only #277 (the PR's actual closing
+// keyword target) is marked done. The #139 fixture used "Closes #277" only,
+// which is not the template's real shape and did not catch this.
+func TestHasMergedWork_BranchLookup_AutopilotCIFixBody_DoesNotMarkDone(t *testing.T) {
+	ts := newMergedWorkTestServer()
+	defer ts.close()
+	ts.repoBody = `{"default_branch":"main"}`
+	ts.searchTotalCount = 0
+	ts.searchWantBase = "main"
+	ts.pullsResponse = `[{"number":278,"title":"GH-277: fix(ci): resolve flaky test",` +
+		`"body":"- **Original Issue**: #275\n\nCloses #277",` +
+		`"merged_at":"2026-09-07T10:00:00Z","base":{"ref":"main"}}]`
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	issue275 := &Issue{Number: 275, Title: "original issue", State: "open"}
+	if poller.hasMergedWork(context.Background(), issue275) {
+		t.Fatal("expected hasMergedWork = false for #275: the PR only bare-mentions it in the Original Issue metadata line")
+	}
+	if ts.hasAddedLabel(LabelDone) {
+		t.Error("pilot-done should not be added to #275 from the autopilot CI-fix PR's Original Issue line")
+	}
+
+	ts.mu.Lock()
+	ts.addedLabels = nil
+	ts.mu.Unlock()
+
+	issue277 := &Issue{Number: 277, Title: "CI flake", State: "open"}
+	if !poller.hasMergedWork(context.Background(), issue277) {
+		t.Fatal("expected hasMergedWork = true for #277: the PR's title and \"Closes #277\" both reference it")
+	}
+	if !ts.hasAddedLabel(LabelDone) {
+		t.Error("expected pilot-done label to be added to #277")
+	}
+}
+
+// TestHasMergedWork_BranchLookupLegacy_ReusedByOtherIssue_DoesNotMarkDone is
+// the legacy-path (default branch unresolved) variant of
+// TestHasMergedWork_BranchLookup_ReusedByOtherIssue_DoesNotMarkDone: when
+// GetRepository fails, hasMergedWork falls back to FindMergedPRByBranch
+// (base-blind). That fallback must still reject a merged PR found on
+// pilot/GH-<n> whose body only bare-mentions the issue rather than closing
+// it (GH-140).
+func TestHasMergedWork_BranchLookupLegacy_ReusedByOtherIssue_DoesNotMarkDone(t *testing.T) {
+	ts := newMergedWorkTestServer()
+	defer ts.close()
+	ts.repoStatus = http.StatusInternalServerError
+	ts.repoBody = `{"message":"internal error"}`
+	ts.searchTotalCount = 0
+	ts.pullsResponse = `[{"number":278,"title":"GH-277: fix(ci): resolve flaky test",` +
+		`"body":"- **Original Issue**: #275\n\nCloses #277",` +
+		`"merged_at":"2026-09-07T10:00:00Z","base":{"ref":"main"}}]`
+
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second)
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	issue := &Issue{Number: 275, Title: "original issue", State: "open"}
+	if poller.hasMergedWork(context.Background(), issue) {
+		t.Fatal("expected hasMergedWork = false via legacy branch lookup when the merged PR only bare-mentions this issue")
+	}
+	if ts.hasAddedLabel(LabelDone) {
+		t.Error("pilot-done should not be added via legacy branch lookup from a bare issue mention")
+	}
+}
+
 // TestHasMergedWork_NonDefaultBaseMerge_DoesNotMarkDone is the GH-117
 // regression case: a stacked PR squash-merged into its stack parent branch
 // (not main) must NOT self-seal the issue as delivered.
@@ -252,5 +328,67 @@ func TestHasMergedWork_DefaultBranchFetchFails_FallsBackToLegacy(t *testing.T) {
 	}
 	if warnCount != 1 {
 		t.Errorf("expected exactly 1 WARN about default branch resolution, got %d", warnCount)
+	}
+}
+
+// TestPrReferencesIssue covers the GH-140 fix directly: a bare "#<n>"
+// reference anywhere in a PR body no longer counts as delivery. Only a
+// "GH-<n>:" title prefix, or a closing keyword (close/fix/resolve, in their
+// inflections) immediately followed by "#<n>", "GH-<n>", or an
+// ".../issues/<n>" URL, counts.
+func TestPrReferencesIssue(t *testing.T) {
+	tests := []struct {
+		name  string
+		title string
+		body  string
+		want  bool
+	}{
+		{
+			name:  "autopilot CI-fix template Original Issue line is not delivery",
+			title: "GH-277: fix(ci): resolve flaky test",
+			body:  "- **Original Issue**: #275\n\nCloses #277",
+			want:  false,
+		},
+		{
+			name: "closing keyword still marks the issue done",
+			body: "Closes #275",
+			want: true,
+		},
+		{
+			name: "reverts PR reference is not delivery",
+			body: "Reverts PR #275",
+			want: false,
+		},
+		{
+			name: "refs reference is not delivery",
+			body: "Refs #275",
+			want: false,
+		},
+		{
+			name: "follow-up reference is not delivery",
+			body: "Follow-up to #275",
+			want: false,
+		},
+		{
+			name: "closing keyword with full issues URL marks the issue done",
+			body: "Closes https://github.com/o/r/issues/275",
+			want: true,
+		},
+		{
+			name: "closing keyword must be word-bounded, #27 does not match #275",
+			body: "Closes #27",
+			want: false,
+		},
+	}
+
+	const issueNumber = 275
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pr := &PullRequest{Title: tt.title, Body: tt.body}
+			if got := prReferencesIssue(pr, issueNumber); got != tt.want {
+				t.Errorf("prReferencesIssue(title=%q, body=%q, issue=%d) = %v, want %v",
+					tt.title, tt.body, issueNumber, got, tt.want)
+			}
+		})
 	}
 }
