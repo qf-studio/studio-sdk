@@ -71,6 +71,11 @@ type ExecutionChecker interface {
 	InvalidateCompletion(taskID, projectPath string) error
 }
 
+type ExecutionCheckerV2 interface {
+	ExecutionChecker
+	HasCompletedExecutionReason(taskID, projectPath string) (skip bool, reason string, err error)
+}
+
 type ExecutionSaver interface {
 	SaveDeclinedExecution(taskID, projectPath, status, reason string) error
 }

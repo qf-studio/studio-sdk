@@ -137,6 +137,22 @@ type ExecutionChecker interface {
 	InvalidateCompletion(taskID, projectPath string) error
 }
 
+// ExecutionCheckerV2 is the reason-carrying evolution of ExecutionChecker.
+// A skip is not always a completed execution — a host may also skip
+// re-dispatch for reasons like a repick-backoff cooldown — and the poller's
+// skip log line should say so instead of always claiming "completed
+// execution exists". Consumers that implement HasCompletedExecutionReason
+// have that reason logged verbatim by the poller; consumers that only
+// implement ExecutionChecker keep seeing the original generic message.
+type ExecutionCheckerV2 interface {
+	ExecutionChecker
+	// HasCompletedExecutionReason reports whether re-dispatch should be
+	// skipped for the task, along with a human-readable reason for a
+	// positive result. An empty reason falls back to the poller's generic
+	// "completed execution exists" message.
+	HasCompletedExecutionReason(taskID, projectPath string) (skip bool, reason string, err error)
+}
+
 // Verdict is the result of a pre-flight judgment on an issue.
 type Verdict struct {
 	Accepted   bool
