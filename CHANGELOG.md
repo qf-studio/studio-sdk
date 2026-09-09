@@ -8,6 +8,22 @@ project is `v0.x`, so breaking changes may still land in minor releases.
 
 ### Fixed
 
+- **github/poller**: the `hasCompletedExecution` skip log line no longer
+  always claims "completed execution exists". `sdk/core` gained
+  `ExecutionCheckerV2`, an optional evolution of `ExecutionChecker` whose
+  `HasCompletedExecutionReason` returns a host-supplied reason alongside the
+  skip decision; the poller logs that reason verbatim (e.g.
+  `reason="repick-backoff cooldown"`) and only falls back to the generic
+  "completed execution exists" message when the host implements the old
+  interface, or the new one with an empty reason. Deferred from pilot PR
+  #5393 (pilot issue #5381 item 4). (GH-142)
+
+  **Consumers whose `ExecutionChecker` skips re-dispatch for reasons other
+  than a genuinely completed execution** (e.g. a repick-backoff cooldown)
+  should implement `ExecutionCheckerV2` and bump their `studio-sdk` pin to
+  get an accurate skip log line instead of maintaining their own
+  workaround log line beforehand.
+
 - **github/poller**: `prReferencesIssue` no longer treats a bare `#<n>`
   reference anywhere in a PR body as delivery of issue `n`. Previously, the
   autopilot CI-fix PR template's `- **Original Issue**: #275` metadata line

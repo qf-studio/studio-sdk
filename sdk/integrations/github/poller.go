@@ -1694,28 +1694,42 @@ func (p *Poller) isTaskStillQueued(issue *Issue) bool {
 	return true
 }
 
-// hasCompletedExecution reports whether a completed execution record already
-// exists for the issue — prevents re-dispatch when the done label failed to
-// apply. On a positive hit the issue is marked processed. Check errors fail
-// open (dispatch rather than lose work).
+// hasCompletedExecution reports whether re-dispatch should be skipped for the
+// issue — e.g. because a completed execution record already exists (the done
+// label failed to apply) or, for hosts implementing ExecutionCheckerV2, some
+// other host-side reason such as a repick-backoff cooldown. On a positive hit
+// the issue is marked processed. Check errors fail open (dispatch rather than
+// lose work).
 func (p *Poller) hasCompletedExecution(issue *Issue) bool {
 	if p.execChecker == nil {
 		return false
 	}
 	taskID := fmt.Sprintf("GH-%d", issue.Number)
-	completed, err := p.execChecker.HasCompletedExecution(taskID, p.projectPath)
+
+	var skip bool
+	var reason string
+	var err error
+	if v2, ok := p.execChecker.(core.ExecutionCheckerV2); ok {
+		skip, reason, err = v2.HasCompletedExecutionReason(taskID, p.projectPath)
+	} else {
+		skip, err = p.execChecker.HasCompletedExecution(taskID, p.projectPath)
+	}
 	if err != nil {
 		p.logger.Warn("Failed to check execution status",
 			slog.Int("number", issue.Number),
 			slog.Any("error", err))
 		return false
 	}
-	if !completed {
+	if !skip {
 		return false
 	}
-	p.logger.Info("Skipping re-dispatch — completed execution exists",
+	if reason == "" {
+		reason = "completed execution exists"
+	}
+	p.logger.Info("Skipping re-dispatch",
 		slog.Int("number", issue.Number),
-		slog.String("task_id", taskID))
+		slog.String("task_id", taskID),
+		slog.String("reason", reason))
 	p.markProcessed(issue.Number)
 	return true
 }

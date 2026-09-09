@@ -1,8 +1,11 @@
 package github
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,6 +47,22 @@ func (f *fakeExecChecker) InvalidateCompletion(taskID, projectPath string) error
 	defer f.mu.Unlock()
 	f.invalidated = append(f.invalidated, taskID)
 	return nil
+}
+
+// fakeExecCheckerV2 implements core.ExecutionCheckerV2. It embeds
+// fakeExecChecker so HasCompletedExecution (the legacy method) stays
+// reachable, while HasCompletedExecutionReason is the one the poller should
+// prefer and whose reason should surface verbatim in the skip log line.
+type fakeExecCheckerV2 struct {
+	fakeExecChecker
+	skip   bool
+	reason string
+}
+
+func (f *fakeExecCheckerV2) HasCompletedExecutionReason(taskID, projectPath string) (bool, string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.skip, f.reason, f.checkErr
 }
 
 type fakeJudge struct {
@@ -413,6 +432,74 @@ func TestPoller_ExecChecker_ErrorFailsOpen(t *testing.T) {
 	defer mu.Unlock()
 	if handled != 1 {
 		t.Fatalf("handler called %d times on checker error, want 1 (fail-open)", handled)
+	}
+}
+
+// TestPoller_ExecCheckerV2_LogsHostReason verifies GH-142: a host implementing
+// ExecutionCheckerV2 that skips re-dispatch for a reason other than a
+// completed execution (e.g. a repick-backoff cooldown) sees that reason in
+// the poller's skip log line, not the generic "completed execution exists".
+func TestPoller_ExecCheckerV2_LogsHostReason(t *testing.T) {
+	ts := newPollerTestServer(hookTestIssue())
+	defer ts.close()
+
+	ec := &fakeExecCheckerV2{skip: true, reason: "repick-backoff cooldown"}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	var handled int32
+	var mu sync.Mutex
+	poller := newHookPoller(t, ts.server.URL, &handled, &mu,
+		WithExecutionChecker(ec, "/tmp/proj"),
+		WithPollerLogger(logger),
+	)
+
+	poller.checkForNewIssues(context.Background())
+	poller.WaitForActive()
+
+	mu.Lock()
+	got := handled
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("handler called %d times with skip=true, want 0", got)
+	}
+	if !poller.IsProcessed(42) {
+		t.Error("issue skipped via ExecutionCheckerV2 should be marked processed")
+	}
+	logOutput := buf.String()
+	if !strings.Contains(logOutput, "repick-backoff cooldown") {
+		t.Errorf("log output missing host reason %q: %s", "repick-backoff cooldown", logOutput)
+	}
+	if strings.Contains(logOutput, "completed execution exists") {
+		t.Errorf("log output should not say \"completed execution exists\" when host gave a reason: %s", logOutput)
+	}
+}
+
+// TestPoller_ExecCheckerV2_EmptyReasonFallsBackToGenericMessage verifies that
+// an ExecutionCheckerV2 host which skips but supplies no reason still gets
+// the original generic "completed execution exists" message, matching the
+// legacy ExecutionChecker behavior.
+func TestPoller_ExecCheckerV2_EmptyReasonFallsBackToGenericMessage(t *testing.T) {
+	ts := newPollerTestServer(hookTestIssue())
+	defer ts.close()
+
+	ec := &fakeExecCheckerV2{skip: true, reason: ""}
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	var handled int32
+	var mu sync.Mutex
+	poller := newHookPoller(t, ts.server.URL, &handled, &mu,
+		WithExecutionChecker(ec, "/tmp/proj"),
+		WithPollerLogger(logger),
+	)
+
+	poller.checkForNewIssues(context.Background())
+	poller.WaitForActive()
+
+	if !poller.IsProcessed(42) {
+		t.Error("issue skipped via ExecutionCheckerV2 should be marked processed")
+	}
+	if !strings.Contains(buf.String(), "completed execution exists") {
+		t.Errorf("expected fallback generic message in log output: %s", buf.String())
 	}
 }
 
