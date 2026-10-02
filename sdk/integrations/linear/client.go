@@ -277,14 +277,39 @@ type pageInfo struct {
 	EndCursor   string `json:"endCursor"`
 }
 
-// ListIssues fetches all issues matching the filter criteria, following
-// pagination cursors until exhausted.
-func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Issue, error) {
-	query := `
-		query ListIssues($teamId: String!, $label: String!, $states: [String!], $first: Int!, $after: String) {
+// teamFilterParts picks the GraphQL variable type and team filter field for a
+// team reference. A UUID filters by team id, whose comparator is typed ID; any
+// other value filters by team key, whose comparator is typed String. Declaring
+// the variable with the wrong type fails Linear's validation
+// (GRAPHQL_VALIDATION_FAILED), so the type must follow the filter field.
+// keyOperator is the comparator used on the key branch.
+func teamFilterParts(teamID, keyOperator string) (varType, filterField, operator string) {
+	if looksLikeUUID(teamID) {
+		return "ID!", "id", "eq"
+	}
+	return "String!", "key", keyOperator
+}
+
+// getLabelQuery renders the GetLabel query for a team key or team UUID.
+func getLabelQuery(teamID string) string {
+	varType, filterField, operator := teamFilterParts(teamID, "eqIgnoreCase")
+	return fmt.Sprintf(`
+		query GetLabel($teamId: %s, $name: String!) {
+			issueLabels(filter: { team: { %s: { %s: $teamId } }, name: { eq: $name } }) {
+				nodes { id name }
+			}
+		}
+	`, varType, filterField, operator)
+}
+
+// listIssuesQuery renders the ListIssues query for a team key or team UUID.
+func listIssuesQuery(teamID string) string {
+	varType, filterField, operator := teamFilterParts(teamID, "eq")
+	return fmt.Sprintf(`
+		query ListIssues($teamId: %s, $label: String!, $states: [String!], $first: Int!, $after: String) {
 			issues(
 				filter: {
-					team: { key: { eq: $teamId } }
+					team: { %s: { %s: $teamId } }
 					labels: { name: { eq: $label } }
 					state: { type: { in: $states } }
 				}
@@ -310,7 +335,48 @@ func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Is
 				pageInfo { hasNextPage endCursor }
 			}
 		}
-	`
+	`, varType, filterField, operator)
+}
+
+// listIssuesSinceQuery renders the ListIssuesSince query for a team key or team UUID.
+func listIssuesSinceQuery(teamID string) string {
+	varType, filterField, operator := teamFilterParts(teamID, "eq")
+	return fmt.Sprintf(`
+		query ListIssuesSince($teamId: %s, $since: DateTimeOrDuration!, $first: Int!, $after: String) {
+			issues(
+				filter: {
+					team: { %s: { %s: $teamId } }
+					updatedAt: { gt: $since }
+				}
+				first: $first
+				after: $after
+				orderBy: updatedAt
+			) {
+				nodes {
+					id
+					identifier
+					title
+					description
+					priority
+					state { id name type }
+					labels { nodes { id name } }
+					assignee { id name email }
+					project { id name }
+					team { id name key }
+					url
+					createdAt
+					updatedAt
+				}
+				pageInfo { hasNextPage endCursor }
+			}
+		}
+	`, varType, filterField, operator)
+}
+
+// ListIssues fetches all issues matching the filter criteria, following
+// pagination cursors until exhausted.
+func (c *Client) ListIssues(ctx context.Context, opts *ListIssuesOptions) ([]*Issue, error) {
+	query := listIssuesQuery(opts.TeamID)
 
 	states := opts.States
 	if len(states) == 0 {
@@ -371,36 +437,7 @@ type ListIssuesSinceOptions struct {
 // It is intended for delta polling with a watermark cursor rather than a full
 // refetch on every poll.
 func (c *Client) ListIssuesSince(ctx context.Context, opts *ListIssuesSinceOptions) ([]*Issue, error) {
-	query := `
-		query ListIssuesSince($teamId: String!, $since: DateTimeOrDuration!, $first: Int!, $after: String) {
-			issues(
-				filter: {
-					team: { key: { eq: $teamId } }
-					updatedAt: { gt: $since }
-				}
-				first: $first
-				after: $after
-				orderBy: updatedAt
-			) {
-				nodes {
-					id
-					identifier
-					title
-					description
-					priority
-					state { id name type }
-					labels { nodes { id name } }
-					assignee { id name email }
-					project { id name }
-					team { id name key }
-					url
-					createdAt
-					updatedAt
-				}
-				pageInfo { hasNextPage endCursor }
-			}
-		}
-	`
+	query := listIssuesSinceQuery(opts.TeamID)
 
 	var issues []*Issue
 	after := ""
@@ -527,19 +564,7 @@ func (c *Client) RemoveLabel(ctx context.Context, issueID, labelID string) error
 // whose configured team key doesn't match Linear's stored casing exactly
 // (GH-135).
 func (c *Client) GetLabelByName(ctx context.Context, teamID, labelName string) (string, error) {
-	filterField := "key"
-	operator := "eqIgnoreCase"
-	if looksLikeUUID(teamID) {
-		filterField = "id"
-		operator = "eq"
-	}
-	query := fmt.Sprintf(`
-		query GetLabel($teamId: String!, $name: String!) {
-			issueLabels(filter: { team: { %s: { %s: $teamId } }, name: { eq: $name } }) {
-				nodes { id name }
-			}
-		}
-	`, filterField, operator)
+	query := getLabelQuery(teamID)
 	var result struct {
 		IssueLabels struct {
 			Nodes []struct {

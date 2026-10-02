@@ -8,6 +8,16 @@ project is `v0.x`, so breaking changes may still land in minor releases.
 
 ### Fixed
 
+- **linear**: `TeamID` may be either the team key or the team UUID, and both
+  now work for label lookup and issue listing. `GetLabelByName` declared
+  `$teamId: String!` even on its UUID branch (`team: { id: ... }`), which
+  Linear rejects with `GRAPHQL_VALIDATION_FAILED` (id comparators take `ID`),
+  so `Poller.Start` failed in `cacheLabelIDs` and a workspace configured with
+  the team UUID never polled. The variable type now follows the filter field
+  (`ID!` for a UUID, `String!` for a key). `ListIssues` and `ListIssuesSince`
+  always filtered `team.key`, so a UUID `TeamID` matched zero issues; they now
+  dispatch on `looksLikeUUID` the same way. (GH-144)
+
 - **github/poller**: the `hasCompletedExecution` skip log line no longer
   always claims "completed execution exists". `sdk/core` gained
   `ExecutionCheckerV2`, an optional evolution of `ExecutionChecker` whose
