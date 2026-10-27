@@ -201,6 +201,9 @@ type PollerDeps struct {
 	ProcessedStore ProcessedStore
 	MaxConcurrent int
 	ExecutionMode string
+	WaitForMerge *bool
+	PRPollInterval time.Duration
+	PRTimeout time.Duration
 	Handler IssueHandler
 	OnPRCreated func(ev PRCreatedEvent)
 	TaskChecker TaskChecker

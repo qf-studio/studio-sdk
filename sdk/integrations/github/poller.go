@@ -420,6 +420,7 @@ func (p *Poller) startParallel(ctx context.Context) {
 func (p *Poller) startSequential(ctx context.Context) {
 	p.logger.Info("Running in sequential mode",
 		slog.Bool("wait_for_merge", p.waitForMerge),
+		slog.Duration("pr_poll_interval", p.prPollInterval),
 		slog.Duration("pr_timeout", p.prTimeout),
 	)
 

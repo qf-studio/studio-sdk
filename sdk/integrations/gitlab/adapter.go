@@ -90,6 +90,21 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	if deps.MaxConcurrent > 0 {
 		opts = append(opts, WithMaxConcurrent(deps.MaxConcurrent))
 	}
+	// WithSequentialConfig overwrites all three fields, so resolve each to its
+	// default first and never pass a zero duration.
+	waitForMerge := true
+	if deps.WaitForMerge != nil {
+		waitForMerge = *deps.WaitForMerge
+	}
+	mrPollInterval := 30 * time.Second
+	if deps.PRPollInterval > 0 {
+		mrPollInterval = deps.PRPollInterval
+	}
+	mrTimeout := time.Hour
+	if deps.PRTimeout > 0 {
+		mrTimeout = deps.PRTimeout
+	}
+	opts = append(opts, WithSequentialConfig(waitForMerge, mrPollInterval, mrTimeout))
 	if deps.OnPRCreated != nil {
 		fn := deps.OnPRCreated
 		opts = append(opts, WithOnMRCreated(func(mrIID int, mrURL string, issueIID int, headSHA string, branchName string) {

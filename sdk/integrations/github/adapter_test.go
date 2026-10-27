@@ -2,6 +2,7 @@ package github
 
 import (
 	"testing"
+	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/core"
 )
@@ -65,5 +66,49 @@ func TestToIssueEvent(t *testing.T) {
 	}
 	if ev.Priority != "high" {
 		t.Errorf("Priority = %q, want %q", ev.Priority, "high")
+	}
+}
+
+func TestNewPollerSequentialSettings_Defaults(t *testing.T) {
+	a := New(&Config{Token: "t", Repo: "o/r"})
+	p := a.NewPoller(core.PollerDeps{}).(*Poller)
+	if !p.waitForMerge || p.prPollInterval != 30*time.Second || p.prTimeout != time.Hour {
+		t.Errorf("got %v/%v/%v, want true/30s/1h", p.waitForMerge, p.prPollInterval, p.prTimeout)
+	}
+}
+
+func TestNewPollerSequentialSettings_AppliedToPoller(t *testing.T) {
+	no := false
+	a := New(&Config{Token: "t", Repo: "o/r"})
+	p := a.NewPoller(core.PollerDeps{
+		WaitForMerge:   &no,
+		PRPollInterval: 15 * time.Second,
+		PRTimeout:      10 * time.Minute,
+	}).(*Poller)
+	if p.waitForMerge || p.prPollInterval != 15*time.Second || p.prTimeout != 10*time.Minute {
+		t.Errorf("got %v/%v/%v, want false/15s/10m", p.waitForMerge, p.prPollInterval, p.prTimeout)
+	}
+}
+
+func TestNewPollerSequentialSettings_ZeroKeepsDefault(t *testing.T) {
+	no := false
+	tests := []struct {
+		name     string
+		deps     core.PollerDeps
+		wantWait bool
+		wantIvl  time.Duration
+		wantTO   time.Duration
+	}{
+		{"zero timeout with wait set", core.PollerDeps{WaitForMerge: &no, PRPollInterval: 15 * time.Second}, false, 15 * time.Second, time.Hour},
+		{"zero interval with timeout set", core.PollerDeps{PRTimeout: 10 * time.Minute}, true, 30 * time.Second, 10 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := New(&Config{Token: "t", Repo: "o/r"})
+			p := a.NewPoller(tt.deps).(*Poller)
+			if p.waitForMerge != tt.wantWait || p.prPollInterval != tt.wantIvl || p.prTimeout != tt.wantTO {
+				t.Errorf("got %v/%v/%v, want %v/%v/%v", p.waitForMerge, p.prPollInterval, p.prTimeout, tt.wantWait, tt.wantIvl, tt.wantTO)
+			}
+		})
 	}
 }
