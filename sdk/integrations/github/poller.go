@@ -84,6 +84,10 @@ type Poller struct {
 
 	pollerMetrics skipreason.PollerMetricsRecorder
 
+	// overlapHolders tracks open issues whose PR is not merged yet, keyed by issue
+	// number, so the overlap hold can expire after prTimeout. Guarded by mu.
+	overlapHolders map[int]*overlapHolderState
+
 	// projectBoardSource sources candidates from a Projects V2 board column instead
 	// of by label. nil means label-based discovery (default, unchanged behavior).
 	projectBoardSource *ProjectBoardSource
@@ -296,6 +300,7 @@ func NewPoller(client *Client, repo string, label string, interval time.Duration
 		prTimeout:            1 * time.Hour,
 		retryGracePeriod:     5 * time.Minute,
 		failedRetryCount:     make(map[int]int),
+		overlapHolders:       make(map[int]*overlapHolderState),
 		maxFailedRetries:     3,
 		retryReadyCount:      make(map[int]int),
 		maxRetryReadyRetries: 3,
@@ -978,6 +983,81 @@ func (p *Poller) recordDeferredScopeOverlap() {
 	}
 }
 
+// overlapHolderState records when the poller first saw an issue as a holder.
+type overlapHolderState struct {
+	since   time.Time
+	expired bool
+}
+
+// overlapHolder is an open issue that still holds its scope: it is running, or
+// its PR is open and unmerged.
+type overlapHolder struct {
+	number    int
+	createdAt time.Time
+	dirs      map[string]bool
+}
+
+func newOverlapHolder(issue *Issue) overlapHolder {
+	return overlapHolder{
+		number:    issue.Number,
+		createdAt: issue.CreatedAt,
+		dirs:      extractDirectoriesFromText(text.SanitizeUntrustedString(issue.Body)),
+	}
+}
+
+// activeOverlapHolders refreshes the first-seen map for the given holders and
+// returns those that have not yet exceeded prTimeout. Map entries for issues
+// that are no longer holders are cleared.
+func (p *Poller) activeOverlapHolders(holders []overlapHolder) []overlapHolder {
+	now := time.Now()
+	current := make(map[int]bool, len(holders))
+	var active []overlapHolder
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, h := range holders {
+		current[h.number] = true
+		st, ok := p.overlapHolders[h.number]
+		if !ok {
+			st = &overlapHolderState{since: now}
+			p.overlapHolders[h.number] = st
+		}
+		if p.prTimeout > 0 && now.Sub(st.since) > p.prTimeout {
+			if !st.expired {
+				st.expired = true
+				p.logger.Warn("overlap hold expired",
+					slog.Int("number", h.number),
+					slog.Duration("pr_timeout", p.prTimeout))
+			}
+			continue
+		}
+		active = append(active, h)
+	}
+	for n := range p.overlapHolders {
+		if !current[n] {
+			delete(p.overlapHolders, n)
+		}
+	}
+	return active
+}
+
+// overlapWithHolder returns the holder and shared directory when issue overlaps
+// an older holder.
+func overlapWithHolder(issue *Issue, holders []overlapHolder) (overlapHolder, string, bool) {
+	dirs := extractDirectoriesFromText(text.SanitizeUntrustedString(issue.Body))
+	for _, h := range holders {
+		if !h.createdAt.Before(issue.CreatedAt) {
+			continue
+		}
+		for d := range dirs {
+			if h.dirs[d] {
+				return h, d, true
+			}
+		}
+	}
+	return overlapHolder{}, "", false
+}
+
 func (p *Poller) checkForNewIssues(ctx context.Context) {
 	issues, err := p.fetchCandidates(ctx)
 	if err != nil {
@@ -986,12 +1066,14 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 	}
 
 	var candidates []*Issue
+	var holders []overlapHolder
 	for _, issue := range issues {
 		if issue.PullRequest != nil {
 			continue
 		}
 
 		if HasLabel(issue, LabelInProgress) {
+			holders = append(holders, newOverlapHolder(issue))
 			p.recordSkip(skipreason.ReasonInProgress)
 			continue
 		}
@@ -1026,6 +1108,7 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 		}
 
 		if HasLabel(issue, LabelDone) {
+			holders = append(holders, newOverlapHolder(issue))
 			p.markProcessed(issue.Number)
 			p.recordSkip(skipreason.ReasonDone)
 			continue
@@ -1041,11 +1124,13 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 					slog.Int("number", issue.Number),
 					slog.Duration("elapsed", time.Since(processedAt)),
 					slog.Duration("grace_period", p.retryGracePeriod))
+				holders = append(holders, newOverlapHolder(issue))
 				p.recordSkip(skipreason.ReasonProcessedGrace)
 				continue
 			}
 
 			if p.isTaskStillQueued(issue) {
+				holders = append(holders, newOverlapHolder(issue))
 				p.recordSkip(skipreason.ReasonTaskQueued)
 				continue
 			}
@@ -1087,6 +1172,7 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 
 	// Group by overlapping scope; dispatch only oldest per group.
 	groups := groupByOverlappingScope(candidates)
+	activeHolders := p.activeOverlapHolders(holders)
 	var toDispatch []*Issue
 	for _, group := range groups {
 		if len(group) == 1 {
@@ -1105,6 +1191,22 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 			}
 		}
 	}
+
+	// Hold candidates that overlap an older open issue whose PR is unmerged.
+	held := toDispatch[:0]
+	for _, issue := range toDispatch {
+		if h, dir, ok := overlapWithHolder(issue, activeHolders); ok {
+			p.logger.Info("Deferring issue: overlaps open PR of older issue",
+				slog.Int("number", issue.Number),
+				slog.Int("holder", h.number),
+				slog.String("directory", dir),
+			)
+			p.recordDeferredScopeOverlap()
+			continue
+		}
+		held = append(held, issue)
+	}
+	toDispatch = held
 
 	for _, issue := range toDispatch {
 		// Refresh labels before dispatch to avoid stale snapshot races.
