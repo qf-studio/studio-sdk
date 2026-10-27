@@ -3,6 +3,7 @@ package gitlab
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/core"
 )
@@ -157,5 +158,49 @@ func TestToIssueEvent_PriorityFromLabel(t *testing.T) {
 
 	if ev.Priority != core.PriorityHigh {
 		t.Errorf("Priority = %q, want %q", ev.Priority, core.PriorityHigh)
+	}
+}
+
+func TestNewPollerSequentialSettings_Defaults(t *testing.T) {
+	a := New(&Config{Token: "t", Project: "g/p"})
+	p := a.NewPoller(core.PollerDeps{}).(*Poller)
+	if !p.waitForMerge || p.mrPollInterval != 30*time.Second || p.mrTimeout != time.Hour {
+		t.Errorf("got %v/%v/%v, want true/30s/1h", p.waitForMerge, p.mrPollInterval, p.mrTimeout)
+	}
+}
+
+func TestNewPollerSequentialSettings_AppliedToPoller(t *testing.T) {
+	no := false
+	a := New(&Config{Token: "t", Project: "g/p"})
+	p := a.NewPoller(core.PollerDeps{
+		WaitForMerge:   &no,
+		PRPollInterval: 15 * time.Second,
+		PRTimeout:      10 * time.Minute,
+	}).(*Poller)
+	if p.waitForMerge || p.mrPollInterval != 15*time.Second || p.mrTimeout != 10*time.Minute {
+		t.Errorf("got %v/%v/%v, want false/15s/10m", p.waitForMerge, p.mrPollInterval, p.mrTimeout)
+	}
+}
+
+func TestNewPollerSequentialSettings_ZeroKeepsDefault(t *testing.T) {
+	no := false
+	tests := []struct {
+		name     string
+		deps     core.PollerDeps
+		wantWait bool
+		wantIvl  time.Duration
+		wantTO   time.Duration
+	}{
+		{"zero timeout with wait set", core.PollerDeps{WaitForMerge: &no, PRPollInterval: 15 * time.Second}, false, 15 * time.Second, time.Hour},
+		{"zero interval with timeout set", core.PollerDeps{PRTimeout: 10 * time.Minute}, true, 30 * time.Second, 10 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := New(&Config{Token: "t", Project: "g/p"})
+			p := a.NewPoller(tt.deps).(*Poller)
+			if p.waitForMerge != tt.wantWait || p.mrPollInterval != tt.wantIvl || p.mrTimeout != tt.wantTO {
+				t.Errorf("got %v/%v/%v, want %v/%v/%v", p.waitForMerge, p.mrPollInterval, p.mrTimeout, tt.wantWait, tt.wantIvl, tt.wantTO)
+			}
+		})
 	}
 }

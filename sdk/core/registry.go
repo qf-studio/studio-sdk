@@ -246,6 +246,18 @@ type PollerDeps struct {
 	// "auto" where supported. Empty means the adapter's own default. Adapters
 	// whose poller does not implement sequential execution ignore this field.
 	ExecutionMode string
+	// WaitForMerge controls whether sequential mode waits for the PR/MR to
+	// merge before dispatching the next issue. Nil means the adapter default
+	// (true); a pointer to false disables the wait. Applies only in sequential
+	// mode.
+	WaitForMerge *bool
+	// PRPollInterval is how often sequential mode checks a pending PR/MR for
+	// merge. Zero means the adapter default (30s). Applies only in sequential
+	// mode.
+	PRPollInterval time.Duration
+	// PRTimeout bounds how long sequential mode waits for a PR/MR to merge.
+	// Zero means the adapter default (1h). Applies only in sequential mode.
+	PRTimeout time.Duration
 	// Handler processes each discovered issue.
 	Handler IssueHandler
 	// OnPRCreated fires after an adapter opens a PR/MR for an issue.

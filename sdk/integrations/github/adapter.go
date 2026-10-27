@@ -123,6 +123,21 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 	if deps.ExecutionMode != "" {
 		opts = append(opts, WithExecutionMode(ExecutionMode(deps.ExecutionMode)))
 	}
+	// WithSequentialConfig overwrites all three fields, so resolve each to its
+	// default first and never pass a zero duration.
+	waitForMerge := true
+	if deps.WaitForMerge != nil {
+		waitForMerge = *deps.WaitForMerge
+	}
+	prPollInterval := 30 * time.Second
+	if deps.PRPollInterval > 0 {
+		prPollInterval = deps.PRPollInterval
+	}
+	prTimeout := time.Hour
+	if deps.PRTimeout > 0 {
+		prTimeout = deps.PRTimeout
+	}
+	opts = append(opts, WithSequentialConfig(waitForMerge, prPollInterval, prTimeout))
 	if deps.OnPRCreated != nil {
 		fn := deps.OnPRCreated
 		opts = append(opts, WithOnPRCreated(func(prNumber int, prURL string, issueNumber int, headSHA string, branchName string, issueNodeID string) {
