@@ -158,6 +158,7 @@ type MessageEvent struct {
 	Args []string
 	CallbackID string
 	Data string
+	Timestamp string
 	Sender Identity
 	Mentions []string
 }

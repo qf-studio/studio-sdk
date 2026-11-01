@@ -8,6 +8,17 @@ project is `v0.x`, so breaking changes may still land in minor releases.
 
 ### Fixed
 
+- **slack**: Socket Mode now handles Slack's `disconnect` message before the
+  empty-`envelope_id` check. `disconnect` messages (`warning`,
+  `refresh_requested`, `link_disabled`) carry no `envelope_id`, so they were
+  skipped with a WARN and the client only reconnected after Slack force-closed
+  the socket (~10 s later). It now logs `slack: disconnect received`, emits
+  `SocketEventDisconnect`, closes, and reconnects at once; an ack is written
+  only when an `envelope_id` is present. The remaining missing-`envelope_id`
+  WARN gains a `type` attribute. `core.MessageEvent` gains `Timestamp`, the
+  platform's own event time; Slack callbacks set it from
+  `actions[0].action_ts`. (GH-152)
+
 - **linear**: `TeamID` may be either the team key or the team UUID, and both
   now work for label lookup and issue listing. `GetLabelByName` declared
   `$teamId: String!` even on its UUID branch (`team: { id: ... }`), which

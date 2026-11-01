@@ -27,6 +27,10 @@ type MessageEvent struct {
 	CallbackID string
 	// Data is the callback payload (e.g. "approve:TASK123") when Action == "callback".
 	Data string
+	// Timestamp is the platform's own time for the event, as the platform
+	// reports it (Slack callback: actions[0].action_ts). Empty when the
+	// platform reports none.
+	Timestamp string
 	// Sender identifies the user who triggered the event.
 	Sender Identity
 	// Mentions lists the user IDs @-mentioned in the message.

@@ -165,8 +165,34 @@ func (h *SocketModeHandler) handleRawMessage(data []byte) {
 		return
 	}
 
+	// disconnect messages carry no envelope_id (Slack docs, "Using Socket
+	// Mode"), so they are handled before the envelope_id check. Close makes
+	// runConnection return so listenLoop reconnects immediately.
+	if env.Type == "disconnect" {
+		reason := env.Reason
+		if reason == "" {
+			reason = "server requested disconnect"
+		}
+		h.log.Info("slack: disconnect received", slog.String("reason", reason))
+		if env.EnvelopeID != "" {
+			if err := h.acknowledge(env.EnvelopeID); err != nil {
+				h.log.Error("slack: failed to acknowledge envelope",
+					slog.String("envelope_id", env.EnvelopeID),
+					slog.Any("error", err))
+			}
+		}
+		h.emit(SocketModeEvent{
+			Type:       SocketEventDisconnect,
+			EnvelopeID: env.EnvelopeID,
+			Payload:    data,
+		})
+		h.Close()
+		return
+	}
+
 	if env.EnvelopeID == "" {
-		h.log.Warn("slack: envelope missing envelope_id, skipping")
+		h.log.Warn("slack: envelope missing envelope_id, skipping",
+			slog.String("type", env.Type))
 		return
 	}
 
@@ -181,21 +207,6 @@ func (h *SocketModeHandler) handleRawMessage(data []byte) {
 	h.log.Debug("slack: envelope received",
 		slog.String("type", env.Type),
 		slog.String("envelope_id", env.EnvelopeID))
-
-	if env.Type == "disconnect" {
-		reason := env.Reason
-		if reason == "" {
-			reason = "server requested disconnect"
-		}
-		h.log.Info("slack: disconnect received", slog.String("reason", reason))
-		h.emit(SocketModeEvent{
-			Type:       SocketEventDisconnect,
-			EnvelopeID: env.EnvelopeID,
-			Payload:    data,
-		})
-		h.Close()
-		return
-	}
 
 	evtType, ok := mapSocketEventType(env.Type)
 	if !ok {

@@ -177,6 +177,34 @@ func TestBridgeHandleCommand(t *testing.T) {
 	}
 }
 
+func TestBridgeCallbackTimestamp(t *testing.T) {
+	tests := []struct {
+		name    string
+		actions string
+		want    string
+	}{
+		{"action_ts carried", `{"action_id":"approve","value":"v","action_ts":"1793466563.669229"}`, "1793466563.669229"},
+		{"no action_ts", `{"action_id":"approve","value":"v"}`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &captureHandler{}
+			br, _ := newTestBridge(t, nil, h, nil, nil)
+			payload := `{"type":"block_actions","user":{"id":"U1"},"channel":{"id":"C1"},"message":{"ts":"1.1"},"actions":[` + tc.actions + `]}`
+			br.processSocketEvent(context.Background(), SocketModeEvent{
+				Type: SocketEventInteraction, EnvelopeID: "e1", Payload: json.RawMessage(payload),
+			})
+			events := h.all()
+			if len(events) != 1 {
+				t.Fatalf("want 1 event, got %d", len(events))
+			}
+			if events[0].Timestamp != tc.want {
+				t.Errorf("Timestamp = %q, want %q", events[0].Timestamp, tc.want)
+			}
+		})
+	}
+}
+
 func TestBridgeHandleBlockActions(t *testing.T) {
 	h := &captureHandler{}
 	br, _ := newTestBridge(t, nil, h, nil, nil)

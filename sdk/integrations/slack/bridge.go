@@ -195,6 +195,7 @@ func (b *bridge) handleInteractive(ctx context.Context, evt SocketModeEvent) {
 		MessageID:  messageTS,
 		CallbackID: action.ActionID,
 		Data:       action.Value,
+		Timestamp:  action.ActionTS,
 		Sender:     identityFromSlackUser(payload.User),
 	}
 
