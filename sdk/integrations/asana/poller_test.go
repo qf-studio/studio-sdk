@@ -704,7 +704,7 @@ func TestPollerParallelExecution(t *testing.T) {
 // before the task handler receives the task — ASCII smuggling guard.
 func TestPollerSanitizeCalledInLivePath(t *testing.T) {
 	// zero-width space (U+200B) injected between "clean" and "title"
-	const smuggled = "clean​title"
+	const smuggled = "clean\u200btitle"
 	const want = "cleantitle"
 
 	client := NewClient(testutil.FakeAsanaToken, testutil.FakeAsanaWorkspaceID)

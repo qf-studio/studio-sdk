@@ -356,7 +356,7 @@ func TestPollerHasStatusLabel(t *testing.T) {
 // Invisible Unicode injected into issue Summary/Description must be stripped
 // before reaching the IssueHandler callback.
 func TestPoller_SanitizeCalledInLivePath(t *testing.T) {
-	zwsp := "​" // U+200B ZERO WIDTH SPACE
+	zwsp := "\u200b" // U+200B ZERO WIDTH SPACE
 	dirtyTitle := "Fix the" + zwsp + " bug"
 	dirtyDesc := "Do the" + zwsp + " thing"
 

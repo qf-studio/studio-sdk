@@ -174,13 +174,14 @@ func TestMessageHandler_CallbackVariant(t *testing.T) {
 		ChannelID:  "C1",
 		CallbackID: "cb-77",
 		Data:       "approve:TASK-99",
+		Timestamp:  "1793466563.669229",
 		Sender:     Identity{UserID: "U3", DisplayName: "Carol", IsBot: false},
 	}
 	if err := handler.HandleMessage(context.Background(), ev); err != nil {
 		t.Fatalf("HandleMessage: %v", err)
 	}
 	got := handler.received[0]
-	if got.CallbackID != "cb-77" || got.Data != "approve:TASK-99" {
+	if got.CallbackID != "cb-77" || got.Data != "approve:TASK-99" || got.Timestamp != "1793466563.669229" {
 		t.Errorf("unexpected callback event: %+v", got)
 	}
 }

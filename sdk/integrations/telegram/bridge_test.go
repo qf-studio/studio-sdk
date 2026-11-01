@@ -173,7 +173,7 @@ func TestBridgeSanitizesInboundText(t *testing.T) {
 	_, br := newBridgeTestServer(t, func(w http.ResponseWriter, r *http.Request) {}, h, nil)
 
 	// U+200B ZERO WIDTH SPACE embedded mid-word — classic invisible prompt injection.
-	poisoned := "hello​world"
+	poisoned := "hello\u200bworld"
 	update := &Update{
 		UpdateID: 4,
 		Message: &Message{
@@ -190,7 +190,7 @@ func TestBridgeSanitizesInboundText(t *testing.T) {
 		t.Fatalf("want 1 event, got %d", len(events))
 	}
 	got := events[0].Text
-	if strings.Contains(got, "​") {
+	if strings.Contains(got, "\u200b") {
 		t.Errorf("handler received unsanitized text %q; invisible unicode must be stripped before HandleMessage", got)
 	}
 	if got != "helloworld" {

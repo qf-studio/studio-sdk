@@ -221,7 +221,7 @@ func TestAdapter_NewPoller_BridgesOnPRCreated(t *testing.T) {
 // before reaching the IssueHandler callback.
 func TestPoller_SanitizeCalledInLivePath(t *testing.T) {
 	// U+200B ZERO WIDTH SPACE — invisible, commonly used in prompt-injection attacks
-	zwsp := "​"
+	zwsp := "\u200b"
 	dirtyTitle := "Fix the" + zwsp + " bug"
 	dirtyDesc := "Do the" + zwsp + " thing"
 
