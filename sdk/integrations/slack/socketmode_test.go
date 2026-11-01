@@ -41,7 +41,7 @@ func TestSocketModeHandler_Disconnect(t *testing.T) {
 				if err != nil {
 					return
 				}
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				if err := c.WriteMessage(websocket.TextMessage, []byte(tc.frame)); err != nil {
 					return
 				}

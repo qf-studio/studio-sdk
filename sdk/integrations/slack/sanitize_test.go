@@ -31,7 +31,7 @@ func TestSanitizeMessageText(t *testing.T) {
 		},
 		{
 			name:  "invisible unicode stripped",
-			input: "hello​world",
+			input: "hello\u200bworld",
 			want:  "helloworld",
 		},
 	}
@@ -51,7 +51,7 @@ func TestSanitizeMessageTextLogsOnStrip(t *testing.T) {
 	handler := slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn})
 	logger := slog.New(handler)
 
-	input := "hello​world"
+	input := "hello\u200bworld"
 	_ = sanitizeMessageText(input, logger)
 
 	logged := logBuf.String()
