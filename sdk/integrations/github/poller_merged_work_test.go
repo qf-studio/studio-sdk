@@ -32,6 +32,8 @@ type mergedWorkTestServer struct {
 	// if non-empty, asserts the query carries that base: qualifier.
 	searchTotalCount int
 	searchWantBase   string
+	// searchItems is the raw JSON array returned as the search "items" (GH-156).
+	searchItems string
 
 	// pullsResponse controls the GET /repos/{owner}/{repo}/pulls response body.
 	pullsResponse string
@@ -54,13 +56,17 @@ func newMergedWorkTestServer() *mergedWorkTestServer {
 			ts.mu.Lock()
 			total := ts.searchTotalCount
 			wantBase := ts.searchWantBase
+			items := ts.searchItems
 			ts.mu.Unlock()
+			if items == "" {
+				items = "[]"
+			}
 			if wantBase != "" && !strings.Contains(r.URL.Query().Get("q"), "base:"+wantBase) {
 				w.WriteHeader(http.StatusBadRequest)
 				_, _ = w.Write([]byte(`{"message":"missing base qualifier"}`))
 				return
 			}
-			_, _ = w.Write([]byte(`{"total_count":` + jsonInt(total) + `}`))
+			_, _ = w.Write([]byte(`{"total_count":` + jsonInt(total) + `,"items":` + items + `}`))
 		case r.Method == http.MethodGet && r.URL.Path == "/repos/owner/repo/pulls":
 			ts.mu.Lock()
 			body := ts.pullsResponse
@@ -298,6 +304,7 @@ func TestHasMergedWork_DefaultBranchFetchFails_FallsBackToLegacy(t *testing.T) {
 	ts.repoBody = `{"message":"internal error"}`
 	// Legacy (base-blind) search finds a merged PR — old behavior preserved.
 	ts.searchTotalCount = 1
+	ts.searchItems = `[{"number":90,"title":"GH-117: fix the thing"}]`
 
 	handler := &capturingHandler{}
 	logger := slog.New(handler)
@@ -390,5 +397,42 @@ func TestPrReferencesIssue(t *testing.T) {
 					tt.title, tt.body, issueNumber, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestHasMergedWork_SearchHitWithoutReferenceDoesNotMarkDone is the GH-156
+// regression case: the title search matches an unrelated merged PR whose title
+// merely contains the bare issue number (pilot-console-ui#299 vs a "$299"
+// price). With no branch-lookup hit the issue must not be marked done.
+func TestHasMergedWork_SearchHitWithoutReferenceDoesNotMarkDone(t *testing.T) {
+	ts := newMergedWorkTestServer()
+	defer ts.close()
+	ts.repoBody = `{"default_branch":"main"}`
+	ts.searchWantBase = "main"
+	ts.searchTotalCount = 1
+	ts.searchItems = `[{"number":163,"title":"GH-162: fix(billing): render the plan price instead of the hardcoded $299"}]`
+
+	handler := &capturingHandler{}
+	client := NewClientWithBaseURL(testutil.FakeGitHubToken, ts.server.URL)
+	poller, err := NewPoller(client, "owner/repo", "pilot", 30*time.Second, WithPollerLogger(slog.New(handler)))
+	if err != nil {
+		t.Fatalf("NewPoller: %v", err)
+	}
+
+	issue := &Issue{Number: 299, Title: "queue rows", State: "open"}
+	if poller.hasMergedWork(context.Background(), issue) {
+		t.Fatal("expected hasMergedWork = false when the search hit does not reference the issue")
+	}
+	if ts.hasAddedLabel(LabelDone) {
+		t.Error("pilot-done should not be added from an unrelated search hit")
+	}
+	logged := false
+	for _, r := range handler.records {
+		if r.Level == slog.LevelInfo && strings.Contains(r.Message, "does not reference this issue") {
+			logged = true
+		}
+	}
+	if !logged {
+		t.Error("expected an INFO line about the non-referencing search hit")
 	}
 }

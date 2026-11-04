@@ -2629,7 +2629,7 @@ func TestSearchMergedPRsForIssue(t *testing.T) {
 			name:        "merged PRs exist",
 			issueNumber: 42,
 			statusCode:  http.StatusOK,
-			response:    `{"total_count": 2}`,
+			response:    `{"total_count": 2, "items": [{"number": 7, "title": "GH-42: fix it"}]}`,
 			wantFound:   true,
 		},
 		{
@@ -2772,7 +2772,7 @@ func TestSearchMergedPRsForIssueOnBase(t *testing.T) {
 			issueNumber: 42,
 			base:        "main",
 			statusCode:  http.StatusOK,
-			response:    `{"total_count": 1}`,
+			response:    `{"total_count": 1, "items": [{"number": 7, "title": "GH-42: fix it"}]}`,
 			wantFound:   true,
 		},
 		{
@@ -4301,6 +4301,48 @@ func TestIsTolerable(t *testing.T) {
 		t.Run(tt.errType, func(t *testing.T) {
 			if got := isTolerable(tt.errType); got != tt.want {
 				t.Errorf("isTolerable(%q) = %v, want %v", tt.errType, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSearchMergedPRsForIssue_IgnoresBareNumberInTitle(t *testing.T) {
+	tests := []struct {
+		name     string
+		response string
+		want     bool
+	}{
+		{
+			name:     "bare number in unrelated title",
+			response: `{"total_count":1,"items":[{"number":163,"title":"GH-162: fix(billing): render the plan price instead of the hardcoded $299"}]}`,
+			want:     false,
+		},
+		{
+			name:     "title prefix references the issue",
+			response: `{"total_count":1,"items":[{"number":164,"title":"GH-299: feat(queue): rows show duration"}]}`,
+			want:     true,
+		},
+		{
+			name:     "closing keyword in body with unrelated title",
+			response: `{"total_count":1,"items":[{"number":165,"title":"feat(queue): rows show duration","body":"Closes #299"}]}`,
+			want:     true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tt.response))
+			}))
+			defer server.Close()
+			client := NewClientWithBaseURL(testutil.FakeGitHubToken, server.URL)
+
+			got, err := client.SearchMergedPRsForIssue(context.Background(), "owner", "repo", 299)
+			if err != nil || got != tt.want {
+				t.Errorf("SearchMergedPRsForIssue() = %v, %v; want %v", got, err, tt.want)
+			}
+			got, err = client.SearchMergedPRsForIssueOnBase(context.Background(), "owner", "repo", 299, "main")
+			if err != nil || got != tt.want {
+				t.Errorf("SearchMergedPRsForIssueOnBase() = %v, %v; want %v", got, err, tt.want)
 			}
 		})
 	}

@@ -1420,18 +1420,28 @@ func prReferencesIssue(pr *PullRequest, issueNumber int) bool {
 func (p *Poller) hasMergedWork(ctx context.Context, issue *Issue) bool {
 	defaultBranch, haveDefaultBranch := p.resolveDefaultBranch(ctx)
 
-	var found bool
-	var err error
+	searchBase := ""
 	if haveDefaultBranch {
-		found, err = p.client.SearchMergedPRsForIssueOnBase(ctx, p.owner, p.repo, issue.Number, defaultBranch)
-	} else {
-		found, err = p.client.SearchMergedPRsForIssue(ctx, p.owner, p.repo, issue.Number)
+		searchBase = defaultBranch
 	}
+	found, unrelated, err := p.client.SearchMergedPRsForIssueDetail(ctx, p.owner, p.repo, issue.Number, searchBase)
 	if err != nil {
 		p.logger.Warn("Failed to check for merged PRs",
 			slog.Int("issue", issue.Number),
 			slog.Any("error", err),
 		)
+	}
+
+	if unrelated != nil {
+		logFields := []any{
+			slog.Int("issue", issue.Number),
+			slog.Int("pr", unrelated.Number),
+			slog.String("pr_title", unrelated.Title),
+		}
+		if refIssue, ok := titleReferencedIssue(unrelated.Title); ok {
+			logFields = append(logFields, slog.Int("references_issue", refIssue))
+		}
+		p.logger.Info("Merged PR found via title search but does not reference this issue, not treating as done", logFields...)
 	}
 
 	if !found {
