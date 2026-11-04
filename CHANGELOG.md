@@ -8,6 +8,15 @@ project is `v0.x`, so breaking changes may still land in minor releases.
 
 ### Fixed
 
+- **github/poller**: `hasMergedWork` no longer marks an issue done from an
+  unrelated merged PR whose title merely contains the bare issue number
+  (e.g. `GH-162: ... $299` matching issue #299). `SearchMergedPRsForIssue`
+  and `SearchMergedPRsForIssueOnBase` now inspect the returned items and
+  report true only when `prReferencesIssue` matches, instead of trusting
+  `total_count > 0`. When the search finds a PR that does not reference the
+  issue, the poller logs an INFO line with the PR number and title and falls
+  through to the branch-name leg. (GH-156)
+
 - **slack**: Socket Mode now handles Slack's `disconnect` message before the
   empty-`envelope_id` check. `disconnect` messages (`warning`,
   `refresh_requested`, `link_disabled`) carry no `envelope_id`, so they were
