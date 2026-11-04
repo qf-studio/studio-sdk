@@ -1197,24 +1197,22 @@ func (c *Client) GetAuthenticatedUser(ctx context.Context) (*User, error) {
 	return &user, nil
 }
 
-// SearchMergedPRsForIssue checks if any merged PRs exist that reference the given
-// issue number in their title. Returns true if at least one merged PR is found.
+// SearchMergedPRsForIssue checks if any merged PR identifies the given issue as
+// the one it delivers. Returns true if at least one merged PR found by the title
+// search satisfies prReferencesIssue.
+//
+// GitHub search tokenises "GH-<n>" as "GH" and "<n>", so the search alone also
+// matches an unrelated PR whose title merely contains the bare number (a price,
+// a line number, another issue); the returned items are therefore verified
+// (GH-156).
 //
 // This does not filter by base branch: a merge into a non-default base (e.g. a
 // stacked PR squash-merged into another feature branch) is indistinguishable from
 // a real delivery here. Prefer SearchMergedPRsForIssueOnBase when the default
 // branch is known (GH-117).
 func (c *Client) SearchMergedPRsForIssue(ctx context.Context, owner, repo string, issueNumber int) (bool, error) {
-	q := fmt.Sprintf("repo:%s/%s GH-%d in:title is:pr is:merged", owner, repo, issueNumber)
-	path := fmt.Sprintf("/search/issues?q=%s&per_page=1", url.QueryEscape(q))
-
-	var result struct {
-		TotalCount int `json:"total_count"`
-	}
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
-		return false, fmt.Errorf("search merged PRs for issue %d: %w", issueNumber, err)
-	}
-	return result.TotalCount > 0, nil
+	found, _, err := c.SearchMergedPRsForIssueDetail(ctx, owner, repo, issueNumber, "")
+	return found, err
 }
 
 // SearchMergedPRsForIssueOnBase is the base-aware counterpart to
@@ -1222,16 +1220,39 @@ func (c *Client) SearchMergedPRsForIssue(ctx context.Context, owner, repo string
 // non-default branch (e.g. a stacked PR landing on its stack parent, not main)
 // does not count as delivery (GH-117).
 func (c *Client) SearchMergedPRsForIssueOnBase(ctx context.Context, owner, repo string, issueNumber int, base string) (bool, error) {
-	q := fmt.Sprintf("repo:%s/%s GH-%d in:title is:pr is:merged base:%s", owner, repo, issueNumber, base)
-	path := fmt.Sprintf("/search/issues?q=%s&per_page=1", url.QueryEscape(q))
+	found, _, err := c.SearchMergedPRsForIssueDetail(ctx, owner, repo, issueNumber, base)
+	return found, err
+}
+
+// SearchMergedPRsForIssueDetail runs the merged-PR title search (restricted to
+// base when non-empty) and reports whether any returned item references the
+// issue. When items matched the search but none reference the issue, the first
+// of them is returned as unrelated so the caller can log it (GH-156).
+func (c *Client) SearchMergedPRsForIssueDetail(ctx context.Context, owner, repo string, issueNumber int, base string) (found bool, unrelated *PullRequest, err error) {
+	q := fmt.Sprintf("repo:%s/%s GH-%d in:title is:pr is:merged", owner, repo, issueNumber)
+	what := fmt.Sprintf("issue %d", issueNumber)
+	if base != "" {
+		q += " base:" + base
+		what += " on base " + base
+	}
+	path := fmt.Sprintf("/search/issues?q=%s&per_page=5", url.QueryEscape(q))
 
 	var result struct {
-		TotalCount int `json:"total_count"`
+		TotalCount int            `json:"total_count"`
+		Items      []*PullRequest `json:"items"`
 	}
 	if err := c.doRequest(ctx, http.MethodGet, path, nil, &result); err != nil {
-		return false, fmt.Errorf("search merged PRs for issue %d on base %s: %w", issueNumber, base, err)
+		return false, nil, fmt.Errorf("search merged PRs for %s: %w", what, err)
 	}
-	return result.TotalCount > 0, nil
+	for _, item := range result.Items {
+		if prReferencesIssue(item, issueNumber) {
+			return true, nil, nil
+		}
+	}
+	if len(result.Items) > 0 {
+		unrelated = result.Items[0]
+	}
+	return false, unrelated, nil
 }
 
 // FindMergedPRByBranch looks up PRs by head branch via the strongly-consistent REST API.
