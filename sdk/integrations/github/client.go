@@ -195,20 +195,21 @@ func (c *Client) withAuthRetry(op func() error) error {
 
 // Issue represents a GitHub issue
 type Issue struct {
-	ID          int64     `json:"id"`
-	NodeID      string    `json:"node_id"` // GraphQL global node ID
-	Number      int       `json:"number"`
-	Title       string    `json:"title"`
-	Body        string    `json:"body"`
-	State       string    `json:"state"`
-	Labels      []Label   `json:"labels"`
-	Assignee    *User     `json:"assignee"`
-	Assignees   []User    `json:"assignees"`
-	User        User      `json:"user"` // Issue author
-	HTMLURL     string    `json:"html_url"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
-	PullRequest *struct{} `json:"pull_request,omitempty"` // Non-nil when item is a PR (GitHub Issues API returns both)
+	ID          int64      `json:"id"`
+	NodeID      string     `json:"node_id"` // GraphQL global node ID
+	Number      int        `json:"number"`
+	Title       string     `json:"title"`
+	Body        string     `json:"body"`
+	State       string     `json:"state"`
+	Labels      []Label    `json:"labels"`
+	Assignee    *User      `json:"assignee"`
+	Assignees   []User     `json:"assignees"`
+	User        User       `json:"user"` // Issue author
+	HTMLURL     string     `json:"html_url"`
+	CreatedAt   time.Time  `json:"created_at"`
+	UpdatedAt   time.Time  `json:"updated_at"`
+	ClosedAt    *time.Time `json:"closed_at"`              // nil (JSON null) for an open issue
+	PullRequest *struct{}  `json:"pull_request,omitempty"` // Non-nil when item is a PR (GitHub Issues API returns both)
 }
 
 // Label represents a GitHub label

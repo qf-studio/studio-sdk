@@ -35,6 +35,9 @@ type IssueSnapshot struct {
 
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	// ClosedAt is when the provider closed the issue. It is nil when the
+	// issue is open or when the provider gives no close time.
+	ClosedAt *time.Time
 
 	// Deleted marks that the issue was removed or archived on the provider
 	// side since the last sync; the shadow diff treats this as a tombstone.

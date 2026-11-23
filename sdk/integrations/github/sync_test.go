@@ -212,6 +212,65 @@ func TestSyncClient_GetIssue(t *testing.T) {
 	}
 }
 
+// TestSyncClient_ListAll_ClosedAt verifies that the payload's closed_at
+// reaches the snapshot for a closed issue and that null gives nil.
+func TestSyncClient_ListAll_ClosedAt(t *testing.T) {
+	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[
+			{"number": 1, "state": "closed", "closed_at": "2026-03-04T05:06:07Z"},
+			{"number": 2, "state": "open", "closed_at": null}
+		]`))
+	})
+
+	snaps, _, err := client.ListAll(context.Background(), "", "")
+	if err != nil {
+		t.Fatalf("ListAll() error = %v", err)
+	}
+	if len(snaps) != 2 {
+		t.Fatalf("got %d snapshots, want 2", len(snaps))
+	}
+	want := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	if snaps[0].ClosedAt == nil || !snaps[0].ClosedAt.Equal(want) {
+		t.Errorf("closed issue ClosedAt = %v, want %v", snaps[0].ClosedAt, want)
+	}
+	if snaps[1].ClosedAt != nil {
+		t.Errorf("open issue ClosedAt = %v, want nil", *snaps[1].ClosedAt)
+	}
+}
+
+// TestSyncClient_GetIssue_ClosedAt verifies GetIssue carries closed_at onto
+// the snapshot for a closed issue and leaves it nil for an open one.
+func TestSyncClient_GetIssue_ClosedAt(t *testing.T) {
+	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		if r.URL.Path == "/repos/owner/repo/issues/7" {
+			_, _ = w.Write([]byte(`{"number": 7, "state": "closed", "closed_at": "2026-01-02T03:04:05Z"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"number": 8, "state": "open", "closed_at": null}`))
+	})
+
+	closed, err := client.GetIssue(context.Background(), "7")
+	if err != nil {
+		t.Fatalf("GetIssue(7) error = %v", err)
+	}
+	want := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	if closed.ClosedAt == nil || !closed.ClosedAt.Equal(want) {
+		t.Errorf("closed issue ClosedAt = %v, want %v", closed.ClosedAt, want)
+	}
+
+	open, err := client.GetIssue(context.Background(), "8")
+	if err != nil {
+		t.Fatalf("GetIssue(8) error = %v", err)
+	}
+	if open.ClosedAt != nil {
+		t.Errorf("open issue ClosedAt = %v, want nil", *open.ClosedAt)
+	}
+}
+
 func TestSyncClient_GetIssue_RejectsPullRequest(t *testing.T) {
 	client := newTestSyncClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

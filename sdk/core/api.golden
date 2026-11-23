@@ -145,6 +145,7 @@ type IssueSnapshot struct {
 	URL string
 	CreatedAt time.Time
 	UpdatedAt time.Time
+	ClosedAt *time.Time
 	Deleted bool
 }
 

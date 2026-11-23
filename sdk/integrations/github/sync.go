@@ -132,6 +132,13 @@ func (s *SyncClient) toSnapshot(owner, repo string, issue *Issue) core.IssueSnap
 	if owner != s.owner || repo != s.repo {
 		nativeID = fmt.Sprintf("%s/%s#%d", owner, repo, issue.Number)
 	}
+	// Copy the close time so the snapshot does not share the decoded
+	// struct's pointer.
+	var closedAt *time.Time
+	if issue.ClosedAt != nil {
+		t := *issue.ClosedAt
+		closedAt = &t
+	}
 	return core.IssueSnapshot{
 		NativeID:   nativeID,
 		SequenceID: "GH-" + strconv.Itoa(issue.Number),
@@ -145,6 +152,7 @@ func (s *SyncClient) toSnapshot(owner, repo string, issue *Issue) core.IssueSnap
 		URL:        issue.HTMLURL,
 		CreatedAt:  issue.CreatedAt,
 		UpdatedAt:  issue.UpdatedAt,
+		ClosedAt:   closedAt,
 	}
 }
 
