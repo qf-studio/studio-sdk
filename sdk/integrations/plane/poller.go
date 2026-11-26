@@ -21,6 +21,14 @@ const (
 	LabelFailed     = "pilot-failed"
 )
 
+// labelSet holds the UUIDs of the pilot-related labels of one project.
+type labelSet struct {
+	pilot      string
+	inProgress string
+	done       string
+	failed     string
+}
+
 // Poller polls Plane.so for work items with the pilot label.
 type Poller struct {
 	client   *Client
@@ -34,11 +42,14 @@ type Poller struct {
 	onPRCreated func(ev core.PRCreatedEvent)
 	logger      *slog.Logger
 
-	// Label UUID cache (resolved on startup by name)
-	pilotLabelID      string
-	inProgressLabelID string
-	doneLabelID       string
-	failedLabelID     string
+	// Label UUID cache (resolved by name on startup, and at each poll for
+	// projects that have no set yet). Plane labels are per-project, so the
+	// same label name has another UUID in each project.
+	// Maps project ID → label set; only projects with the pilot label have one.
+	labelIDs map[string]labelSet
+	// Projects whose label lookup has failed once (later failures log at Debug).
+	labelLookupFailed map[string]bool
+	labelMu           sync.RWMutex // protects labelIDs + labelLookupFailed
 
 	// Persistent processed store (optional)
 	processedStore core.ProcessedStore
@@ -106,6 +117,9 @@ func NewPoller(client *Client, config *Config, interval time.Duration, opts ...P
 		interval:  interval,
 		processed: make(map[string]bool),
 		logger:    slog.Default(),
+
+		labelIDs:          make(map[string]labelSet),
+		labelLookupFailed: make(map[string]bool),
 	}
 
 	for _, opt := range opts {
@@ -178,55 +192,105 @@ func (p *Poller) Start(ctx context.Context) error {
 	}
 }
 
-// cacheLabelIDs fetches and caches the UUIDs for pilot-related labels across all configured projects.
-// Plane labels are per-project, so we resolve from the first project that has matching labels.
+// pilotLabelName returns the name of the label that marks a work item for pickup.
+func (p *Poller) pilotLabelName() string {
+	if p.config.TriggerLabel != "" {
+		return p.config.TriggerLabel
+	}
+	return LabelPilot
+}
+
+// cacheLabelIDs fetches and caches the UUIDs for pilot-related labels of each configured project.
+// Plane labels are per-project, so each project gets its own label set.
+// It returns an error only when no configured project has the pilot label.
 func (p *Poller) cacheLabelIDs(ctx context.Context) error {
-	pilotLabelName := p.config.TriggerLabel
-	if pilotLabelName == "" {
-		pilotLabelName = LabelPilot
-	}
-
+	found := false
 	for _, projectID := range p.config.ProjectIDs {
-		labels, err := p.client.ListLabels(ctx, p.config.WorkspaceSlug, projectID)
-		if err != nil {
-			p.logger.Warn("Failed to list labels for project",
-				slog.String("project_id", projectID),
-				slog.Any("error", err),
-			)
-			continue
-		}
-
-		for _, label := range labels {
-			switch {
-			case strings.EqualFold(label.Name, pilotLabelName):
-				p.pilotLabelID = label.ID
-			case strings.EqualFold(label.Name, LabelInProgress):
-				p.inProgressLabelID = label.ID
-			case strings.EqualFold(label.Name, LabelDone):
-				p.doneLabelID = label.ID
-			case strings.EqualFold(label.Name, LabelFailed):
-				p.failedLabelID = label.ID
-			}
-		}
-
-		// If we found the pilot label, stop looking
-		if p.pilotLabelID != "" {
-			break
+		if p.lookUpLabels(ctx, projectID) {
+			found = true
 		}
 	}
 
-	if p.pilotLabelID == "" {
-		return fmt.Errorf("pilot label %q not found in any configured project", pilotLabelName)
+	if !found {
+		return fmt.Errorf("pilot label %q not found in any configured project", p.pilotLabelName())
 	}
+	return nil
+}
+
+// lookUpLabels fetches the labels of one project and stores its label set
+// when the project has the pilot label. The first failure of a project logs
+// a Warn; a repeat logs at Debug. It reports whether the set was stored.
+func (p *Poller) lookUpLabels(ctx context.Context, projectID string) bool {
+	pilotLabelName := p.pilotLabelName()
+
+	labels, err := p.client.ListLabels(ctx, p.config.WorkspaceSlug, projectID)
+	if err != nil {
+		p.logLabelLookupFailure("Failed to list labels for project",
+			projectID,
+			slog.String("project_id", projectID),
+			slog.Any("error", err),
+		)
+		return false
+	}
+
+	var set labelSet
+	for _, label := range labels {
+		switch {
+		case strings.EqualFold(label.Name, pilotLabelName):
+			set.pilot = label.ID
+		case strings.EqualFold(label.Name, LabelInProgress):
+			set.inProgress = label.ID
+		case strings.EqualFold(label.Name, LabelDone):
+			set.done = label.ID
+		case strings.EqualFold(label.Name, LabelFailed):
+			set.failed = label.ID
+		}
+	}
+
+	if set.pilot == "" {
+		p.logLabelLookupFailure("Pilot label not found in project; project is skipped",
+			projectID,
+			slog.String("project_id", projectID),
+			slog.String("label", pilotLabelName),
+		)
+		return false
+	}
+
+	p.labelMu.Lock()
+	p.labelIDs[projectID] = set
+	p.labelMu.Unlock()
 
 	p.logger.Debug("Cached label IDs",
-		slog.String("pilot", p.pilotLabelID),
-		slog.String("in_progress", p.inProgressLabelID),
-		slog.String("done", p.doneLabelID),
-		slog.String("failed", p.failedLabelID),
+		slog.String("project_id", projectID),
+		slog.String("pilot", set.pilot),
+		slog.String("in_progress", set.inProgress),
+		slog.String("done", set.done),
+		slog.String("failed", set.failed),
 	)
+	return true
+}
 
-	return nil
+// logLabelLookupFailure logs a Warn on the first label lookup failure of a project
+// and a Debug line on each repeat.
+func (p *Poller) logLabelLookupFailure(msg, projectID string, attrs ...any) {
+	p.labelMu.Lock()
+	repeat := p.labelLookupFailed[projectID]
+	p.labelLookupFailed[projectID] = true
+	p.labelMu.Unlock()
+
+	if repeat {
+		p.logger.Debug(msg, attrs...)
+		return
+	}
+	p.logger.Warn(msg, attrs...)
+}
+
+// projectLabels returns the label set of a project, if it has one.
+func (p *Poller) projectLabels(projectID string) (labelSet, bool) {
+	p.labelMu.RLock()
+	defer p.labelMu.RUnlock()
+	set, ok := p.labelIDs[projectID]
+	return set, ok
 }
 
 // cacheStateIDs fetches and caches the UUIDs for started/completed state groups per project.
@@ -269,12 +333,13 @@ func (p *Poller) cacheStateIDs(ctx context.Context) {
 // and removes the label so they can be picked up again.
 // This handles restart/crash scenarios where items were left orphaned.
 func (p *Poller) recoverOrphanedIssues(ctx context.Context) {
-	if p.inProgressLabelID == "" {
-		return
-	}
-
 	for _, projectID := range p.config.ProjectIDs {
-		items, err := p.client.ListWorkItems(ctx, p.config.WorkspaceSlug, projectID, p.inProgressLabelID)
+		labels, ok := p.projectLabels(projectID)
+		if !ok || labels.inProgress == "" {
+			continue
+		}
+
+		items, err := p.client.ListWorkItems(ctx, p.config.WorkspaceSlug, projectID, labels.inProgress)
 		if err != nil {
 			p.logger.Warn("Failed to check for orphaned issues",
 				slog.String("project_id", projectID),
@@ -293,7 +358,7 @@ func (p *Poller) recoverOrphanedIssues(ctx context.Context) {
 		)
 
 		for _, item := range items {
-			if err := p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, projectID, item.ID, p.inProgressLabelID); err != nil {
+			if err := p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, projectID, item.ID, labels.inProgress); err != nil {
 				p.logger.Warn("Failed to remove in-progress label from orphaned issue",
 					slog.String("id", item.ID),
 					slog.Any("error", err),
@@ -314,7 +379,23 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 	var allItems []WorkItem
 
 	for _, projectID := range p.config.ProjectIDs {
-		items, err := p.client.ListWorkItems(ctx, p.config.WorkspaceSlug, projectID, p.pilotLabelID)
+		labels, ok := p.projectLabels(projectID)
+		if !ok {
+			// Label list failed at startup or the pilot label was missing: look up again.
+			if !p.lookUpLabels(ctx, projectID) {
+				continue
+			}
+			p.logger.Info("Found pilot label for project; project is now polled",
+				slog.String("project_id", projectID),
+			)
+			labels, _ = p.projectLabels(projectID)
+		}
+		// Never list without a label filter: that would return every work item.
+		if labels.pilot == "" {
+			continue
+		}
+
+		items, err := p.client.ListWorkItems(ctx, p.config.WorkspaceSlug, projectID, labels.pilot)
 		if err != nil {
 			p.logger.Warn("Failed to fetch work items",
 				slog.String("project_id", projectID),
@@ -343,7 +424,7 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 		// Skip if has status label (in-progress, done, or failed)
 		if p.hasStatusLabel(&item) {
 			// Only mark as processed if it has done label (allow retry of failed)
-			if HasLabelID(&item, p.doneLabelID) {
+			if labels, ok := p.projectLabels(item.ProjectID); ok && labels.done != "" && HasLabelID(&item, labels.done) {
 				p.markProcessed(item.ID)
 			}
 			continue
@@ -392,9 +473,12 @@ func (p *Poller) processIssueAsync(ctx context.Context, item WorkItem) {
 	// consumers see them. See sanitize.go for the shared helper.
 	sanitizeWorkItemInPlace(p.logger, &item)
 
+	// Status labels are per-project: use the label set of the work item's project.
+	labels, _ := p.projectLabels(item.ProjectID)
+
 	// Add in-progress label
-	if p.inProgressLabelID != "" {
-		_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, p.inProgressLabelID)
+	if labels.inProgress != "" {
+		_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, labels.inProgress)
 	}
 
 	// Transition to started state on dispatch
@@ -414,23 +498,23 @@ func (p *Poller) processIssueAsync(ctx context.Context, item WorkItem) {
 			slog.Any("error", err),
 		)
 		// Remove in-progress label, add failed label
-		if p.inProgressLabelID != "" {
-			_ = p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, p.inProgressLabelID)
+		if labels.inProgress != "" {
+			_ = p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, labels.inProgress)
 		}
-		if p.failedLabelID != "" {
-			_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, p.failedLabelID)
+		if labels.failed != "" {
+			_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, labels.failed)
 		}
 		return
 	}
 
 	// Remove in-progress label
-	if p.inProgressLabelID != "" {
-		_ = p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, p.inProgressLabelID)
+	if labels.inProgress != "" {
+		_ = p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, labels.inProgress)
 	}
 
 	// Add done label on success
-	if result != nil && result.Success && p.doneLabelID != "" {
-		_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, p.doneLabelID)
+	if result != nil && result.Success && labels.done != "" {
+		_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, labels.done)
 	}
 
 	// Transition to completed state on success
@@ -476,15 +560,19 @@ func (p *Poller) processIssueAsync(ctx context.Context, item WorkItem) {
 	}
 }
 
-// hasStatusLabel checks if a work item has any status label UUID.
+// hasStatusLabel checks if a work item has any status label UUID of its project.
 func (p *Poller) hasStatusLabel(item *WorkItem) bool {
-	if p.inProgressLabelID != "" && HasLabelID(item, p.inProgressLabelID) {
+	labels, ok := p.projectLabels(item.ProjectID)
+	if !ok {
+		return false
+	}
+	if labels.inProgress != "" && HasLabelID(item, labels.inProgress) {
 		return true
 	}
-	if p.doneLabelID != "" && HasLabelID(item, p.doneLabelID) {
+	if labels.done != "" && HasLabelID(item, labels.done) {
 		return true
 	}
-	if p.failedLabelID != "" && HasLabelID(item, p.failedLabelID) {
+	if labels.failed != "" && HasLabelID(item, labels.failed) {
 		return true
 	}
 	return false
