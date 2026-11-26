@@ -53,6 +53,7 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 		a.config.BaseURL,
 		a.config.APIKey,
 		WithWorkspaceSlug(a.config.WorkspaceSlug),
+		WithClientLogger(deps.Logger),
 	)
 
 	interval := 5 * time.Minute
@@ -69,6 +70,9 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 
 	if deps.ProcessedStore != nil {
 		opts = append(opts, WithProcessedStore(deps.ProcessedStore))
+	}
+	if deps.Logger != nil {
+		opts = append(opts, WithPollerLogger(deps.Logger))
 	}
 	if deps.MaxConcurrent > 0 {
 		opts = append(opts, WithMaxConcurrent(deps.MaxConcurrent))

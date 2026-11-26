@@ -50,10 +50,13 @@ func WithDefaultProjectID(projectID string) ClientOption {
 	}
 }
 
-// WithClientLogger sets the logger for the client.
+// WithClientLogger sets the logger for the client. A nil logger keeps the
+// default (slog.Default()).
 func WithClientLogger(logger *slog.Logger) ClientOption {
 	return func(c *Client) {
-		c.logger = logger
+		if logger != nil {
+			c.logger = logger
+		}
 	}
 }
 
@@ -153,7 +156,9 @@ const maxWorkItemPages = 50
 // ListWorkItems fetches work items for a project, optionally filtered by label ID.
 // It follows the response cursor until the last page, or until
 // maxWorkItemPages pages are read; then it returns the items read so far and
-// logs a Warn. An error on any page returns the error and no items.
+// logs a Warn. A page with an empty body, no "results" key or "results":null
+// holds no items and ends the list. An error on any page returns the error
+// and no items.
 func (c *Client) ListWorkItems(ctx context.Context, workspaceSlug, projectID, labelID string) ([]WorkItem, error) {
 	base := workItemsBase(workspaceSlug, projectID) + "/"
 
@@ -187,7 +192,7 @@ func (c *Client) ListWorkItems(ctx context.Context, workspaceSlug, projectID, la
 			return nil, err
 		}
 		if len(resp.Results) == 0 || string(resp.Results) == "null" {
-			return nil, fmt.Errorf("failed to parse response: no results array")
+			return items, nil
 		}
 		var raws []json.RawMessage
 		if err := json.Unmarshal(resp.Results, &raws); err != nil {
