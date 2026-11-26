@@ -29,6 +29,20 @@ type labelSet struct {
 	failed     string
 }
 
+// labelLookupFailure is a kind of label lookup failure of a project.
+type labelLookupFailure int
+
+const (
+	labelListFailed labelLookupFailure = iota
+	pilotLabelNotFound
+)
+
+// labelLookupKey keys the label lookup failures by project and kind.
+type labelLookupKey struct {
+	projectID string
+	kind      labelLookupFailure
+}
+
 // Poller polls Plane.so for work items with the pilot label.
 type Poller struct {
 	client   *Client
@@ -47,8 +61,9 @@ type Poller struct {
 	// same label name has another UUID in each project.
 	// Maps project ID → label set; only projects with the pilot label have one.
 	labelIDs map[string]labelSet
-	// Projects whose label lookup has failed once (later failures log at Debug).
-	labelLookupFailed map[string]bool
+	// Project and kind of each label lookup failure seen once (later failures
+	// of the same kind log at Debug).
+	labelLookupFailed map[labelLookupKey]bool
 	labelMu           sync.RWMutex // protects labelIDs + labelLookupFailed
 
 	// Persistent processed store (optional)
@@ -119,7 +134,7 @@ func NewPoller(client *Client, config *Config, interval time.Duration, opts ...P
 		logger:    slog.Default(),
 
 		labelIDs:          make(map[string]labelSet),
-		labelLookupFailed: make(map[string]bool),
+		labelLookupFailed: make(map[labelLookupKey]bool),
 	}
 
 	for _, opt := range opts {
@@ -218,15 +233,15 @@ func (p *Poller) cacheLabelIDs(ctx context.Context) error {
 }
 
 // lookUpLabels fetches the labels of one project and stores its label set
-// when the project has the pilot label. The first failure of a project logs
-// a Warn; a repeat logs at Debug. It reports whether the set was stored.
+// when the project has the pilot label. The first failure of each kind of a
+// project logs a Warn; a repeat of the same kind logs at Debug. It reports whether the set was stored.
 func (p *Poller) lookUpLabels(ctx context.Context, projectID string) bool {
 	pilotLabelName := p.pilotLabelName()
 
 	labels, err := p.client.ListLabels(ctx, p.config.WorkspaceSlug, projectID)
 	if err != nil {
 		p.logLabelLookupFailure("Failed to list labels for project",
-			projectID,
+			projectID, labelListFailed,
 			slog.String("project_id", projectID),
 			slog.Any("error", err),
 		)
@@ -249,7 +264,7 @@ func (p *Poller) lookUpLabels(ctx context.Context, projectID string) bool {
 
 	if set.pilot == "" {
 		p.logLabelLookupFailure("Pilot label not found in project; project is skipped",
-			projectID,
+			projectID, pilotLabelNotFound,
 			slog.String("project_id", projectID),
 			slog.String("label", pilotLabelName),
 		)
@@ -270,12 +285,13 @@ func (p *Poller) lookUpLabels(ctx context.Context, projectID string) bool {
 	return true
 }
 
-// logLabelLookupFailure logs a Warn on the first label lookup failure of a project
-// and a Debug line on each repeat.
-func (p *Poller) logLabelLookupFailure(msg, projectID string, attrs ...any) {
+// logLabelLookupFailure logs a Warn on the first label lookup failure of each
+// kind of a project and a Debug line on each repeat of that kind.
+func (p *Poller) logLabelLookupFailure(msg, projectID string, kind labelLookupFailure, attrs ...any) {
+	key := labelLookupKey{projectID: projectID, kind: kind}
 	p.labelMu.Lock()
-	repeat := p.labelLookupFailed[projectID]
-	p.labelLookupFailed[projectID] = true
+	repeat := p.labelLookupFailed[key]
+	p.labelLookupFailed[key] = true
 	p.labelMu.Unlock()
 
 	if repeat {
@@ -334,44 +350,50 @@ func (p *Poller) cacheStateIDs(ctx context.Context) {
 // This handles restart/crash scenarios where items were left orphaned.
 func (p *Poller) recoverOrphanedIssues(ctx context.Context) {
 	for _, projectID := range p.config.ProjectIDs {
-		labels, ok := p.projectLabels(projectID)
-		if !ok || labels.inProgress == "" {
-			continue
-		}
+		p.recoverOrphanedIssuesOfProject(ctx, projectID)
+	}
+}
 
-		items, err := p.client.ListWorkItems(ctx, p.config.WorkspaceSlug, projectID, labels.inProgress)
-		if err != nil {
-			p.logger.Warn("Failed to check for orphaned issues",
-				slog.String("project_id", projectID),
+// recoverOrphanedIssuesOfProject removes the pilot-in-progress label from the
+// work items of one project that has a label set.
+func (p *Poller) recoverOrphanedIssuesOfProject(ctx context.Context, projectID string) {
+	labels, ok := p.projectLabels(projectID)
+	if !ok || labels.inProgress == "" {
+		return
+	}
+
+	items, err := p.client.ListWorkItems(ctx, p.config.WorkspaceSlug, projectID, labels.inProgress)
+	if err != nil {
+		p.logger.Warn("Failed to check for orphaned issues",
+			slog.String("project_id", projectID),
+			slog.Any("error", err),
+		)
+		return
+	}
+
+	if len(items) == 0 {
+		return
+	}
+
+	p.logger.Info("Recovering orphaned in-progress issues",
+		slog.String("project_id", projectID),
+		slog.Int("count", len(items)),
+	)
+
+	for _, item := range items {
+		if err := p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, projectID, item.ID, labels.inProgress); err != nil {
+			p.logger.Warn("Failed to remove in-progress label from orphaned issue",
+				slog.String("id", item.ID),
 				slog.Any("error", err),
 			)
 			continue
 		}
-
-		if len(items) == 0 {
-			continue
-		}
-
-		p.logger.Info("Recovering orphaned in-progress issues",
-			slog.String("project_id", projectID),
-			slog.Int("count", len(items)),
+		// Also clear from processed map/store so the first poll cycle picks it up.
+		p.ClearProcessed(item.ID)
+		p.logger.Info("Recovered orphaned issue",
+			slog.String("id", item.ID),
+			slog.String("name", item.Name),
 		)
-
-		for _, item := range items {
-			if err := p.client.RemoveLabel(ctx, p.config.WorkspaceSlug, projectID, item.ID, labels.inProgress); err != nil {
-				p.logger.Warn("Failed to remove in-progress label from orphaned issue",
-					slog.String("id", item.ID),
-					slog.Any("error", err),
-				)
-				continue
-			}
-			// Also clear from processed map/store so the first poll cycle picks it up.
-			p.ClearProcessed(item.ID)
-			p.logger.Info("Recovered orphaned issue",
-				slog.String("id", item.ID),
-				slog.String("name", item.Name),
-			)
-		}
 	}
 }
 
@@ -389,6 +411,8 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 				slog.String("project_id", projectID),
 			)
 			labels, _ = p.projectLabels(projectID)
+			// The start-up recovery did not see this project: run it now.
+			p.recoverOrphanedIssuesOfProject(ctx, projectID)
 		}
 		// Never list without a label filter: that would return every work item.
 		if labels.pilot == "" {
@@ -402,6 +426,13 @@ func (p *Poller) checkForNewIssues(ctx context.Context) {
 				slog.Any("error", err),
 			)
 			continue
+		}
+		// Status labels are keyed on the project: a work item with no project
+		// key belongs to the project that listed it.
+		for i := range items {
+			if items[i].ProjectID == "" {
+				items[i].ProjectID = projectID
+			}
 		}
 		allItems = append(allItems, items...)
 	}
