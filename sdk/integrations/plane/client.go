@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -143,47 +144,77 @@ func workItemsBase(workspaceSlug, projectID string) string {
 	return fmt.Sprintf("/api/v1/workspaces/%s/projects/%s/work-items", workspaceSlug, projectID)
 }
 
+// workItemsPerPage is the page size asked of the Plane API (its maximum).
+const workItemsPerPage = 100
+
+// maxWorkItemPages caps the pages one ListWorkItems call reads.
+const maxWorkItemPages = 50
+
 // ListWorkItems fetches work items for a project, optionally filtered by label ID.
-// Pass empty labelID to list all work items.
+// It follows the response cursor until the last page, or until
+// maxWorkItemPages pages are read; then it returns the items read so far and
+// logs a Warn. An error on any page returns the error and no items.
 func (c *Client) ListWorkItems(ctx context.Context, workspaceSlug, projectID, labelID string) ([]WorkItem, error) {
-	path := workItemsBase(workspaceSlug, projectID) + "/"
-	if labelID != "" {
-		path += "?label=" + labelID
-	}
+	base := workItemsBase(workspaceSlug, projectID) + "/"
 
-	// Decode the page item by item so one work item that does not decode
-	// is skipped instead of failing the whole page.
-	var resp struct {
-		Results json.RawMessage `json:"results"`
-	}
-	if err := c.doRequest(ctx, http.MethodGet, path, nil, &resp); err != nil {
-		return nil, err
-	}
-	if len(resp.Results) == 0 || string(resp.Results) == "null" {
-		return nil, fmt.Errorf("failed to parse response: no results array")
-	}
-	var raws []json.RawMessage
-	if err := json.Unmarshal(resp.Results, &raws); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	items := make([]WorkItem, 0, len(raws))
-	for _, raw := range raws {
-		var item WorkItem
-		if err := json.Unmarshal(raw, &item); err != nil {
-			var ref struct {
-				ID string `json:"id"`
-			}
-			_ = json.Unmarshal(raw, &ref)
-			c.logger.Warn("Skipping Plane work item that does not decode",
+	items := []WorkItem{}
+	cursor := ""
+	for page := 0; ; page++ {
+		if page == maxWorkItemPages {
+			c.logger.Warn("Plane work item list reached the page limit; returning the items read so far",
 				slog.String("project_id", projectID),
-				slog.String("work_item_id", ref.ID),
-				slog.Any("error", err))
-			continue
+				slog.Int("page_limit", maxWorkItemPages))
+			return items, nil
 		}
-		items = append(items, item)
+
+		query := url.Values{}
+		query.Set("per_page", strconv.Itoa(workItemsPerPage))
+		if labelID != "" {
+			query.Set("label", labelID)
+		}
+		if cursor != "" {
+			query.Set("cursor", cursor)
+		}
+
+		// Decode the page item by item so one work item that does not decode
+		// is skipped instead of failing the whole page.
+		var resp struct {
+			Results         json.RawMessage `json:"results"`
+			NextCursor      string          `json:"next_cursor"`
+			NextPageResults bool            `json:"next_page_results"`
+		}
+		if err := c.doRequest(ctx, http.MethodGet, base+"?"+query.Encode(), nil, &resp); err != nil {
+			return nil, err
+		}
+		if len(resp.Results) == 0 || string(resp.Results) == "null" {
+			return nil, fmt.Errorf("failed to parse response: no results array")
+		}
+		var raws []json.RawMessage
+		if err := json.Unmarshal(resp.Results, &raws); err != nil {
+			return nil, fmt.Errorf("failed to parse response: %w", err)
+		}
+
+		for _, raw := range raws {
+			var item WorkItem
+			if err := json.Unmarshal(raw, &item); err != nil {
+				var ref struct {
+					ID string `json:"id"`
+				}
+				_ = json.Unmarshal(raw, &ref)
+				c.logger.Warn("Skipping Plane work item that does not decode",
+					slog.String("project_id", projectID),
+					slog.String("work_item_id", ref.ID),
+					slog.Any("error", err))
+				continue
+			}
+			items = append(items, item)
+		}
+
+		if !resp.NextPageResults || resp.NextCursor == "" {
+			return items, nil
+		}
+		cursor = resp.NextCursor
 	}
-	return items, nil
 }
 
 // GetWorkItem fetches a single work item by ID.
