@@ -124,9 +124,8 @@ func TestListWorkItemsSkipsAnItemThatDoesNotDecode(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "no results array",
-			body:    `{"total_count":0}`,
-			wantErr: true,
+			name: "no results array",
+			body: `{"total_count":0}`,
 		},
 		{
 			name:    "results is not an array",
@@ -182,6 +181,64 @@ func TestListWorkItemsSkipsAnItemThatDoesNotDecode(t *testing.T) {
 				if strings.Contains(logOut, `"name":42`) {
 					t.Errorf("log holds the raw JSON of the item; log:\n%s", logOut)
 				}
+			}
+		})
+	}
+}
+
+// mutation pin: WithClientLogger(nil) keeps the default logger, so a work item that does not decode does not panic on a nil logger -> this test fails
+func TestWithClientLoggerNilKeepsDefault(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"id":"wi-1","name":42},{"id":"wi-2","name":"Second"}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, testutil.FakePlaneAPIKey, WithClientLogger(nil))
+	if c.logger == nil {
+		t.Fatal("WithClientLogger(nil) left the client with a nil logger")
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("ListWorkItems panicked with WithClientLogger(nil): %v", r)
+		}
+	}()
+	items, err := c.ListWorkItems(context.Background(), "ws", "proj-1", "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "wi-2" {
+		t.Errorf("got %+v, want only wi-2", items)
+	}
+}
+
+// mutation pin: an empty body, no "results" key or "results":null is an empty page, not an error -> this test fails
+func TestListWorkItemsEmptyPageIsNotAnError(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "empty body", body: ""},
+		{name: "no results key", body: `{"total_count":0}`},
+		{name: "results is null", body: `{"results":null,"total_count":0}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			c := NewClient(srv.URL, testutil.FakePlaneAPIKey)
+			items, err := c.ListWorkItems(context.Background(), "ws", "proj-1", "")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(items) != 0 {
+				t.Errorf("got %d items, want 0", len(items))
 			}
 		})
 	}
