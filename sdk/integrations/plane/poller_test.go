@@ -30,6 +30,8 @@ type fakePlane struct {
 	items map[string][]WorkItem
 
 	labelListRequests map[string]int
+	// project ID → number of work item requests (list, get and patch)
+	workItemRequests map[string]int
 	// project ID → label query value of each work item list request
 	listLabelFilters map[string][]string
 	// work item ID → label IDs set by each PATCH request
@@ -43,6 +45,7 @@ func newFakePlane(t *testing.T) *fakePlane {
 		labelFailures:     make(map[string]int),
 		items:             make(map[string][]WorkItem),
 		labelListRequests: make(map[string]int),
+		workItemRequests:  make(map[string]int),
 		listLabelFilters:  make(map[string][]string),
 		patches:           make(map[string][][]string),
 	}
@@ -70,6 +73,9 @@ func (f *fakePlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer f.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
+	if resource == "work-items" {
+		f.workItemRequests[projectID]++
+	}
 	switch {
 	case resource == "labels":
 		f.labelListRequests[projectID]++
@@ -137,10 +143,15 @@ func projectLabelsFor(prefix string) []Label {
 	}
 }
 
+// startTimeout bounds each call of Start, so a Start that does not return
+// fails the test and does not hang the package.
+const startTimeout = 10 * time.Second
+
 // runPoller starts the poller and waits until done reports true (or a timeout), then stops it.
 func runPoller(t *testing.T, p *Poller, done func() bool) error {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+	defer cancel()
 	errCh := make(chan error, 1)
 	go func() { errCh <- p.Start(ctx) }()
 
@@ -154,12 +165,24 @@ func runPoller(t *testing.T, p *Poller, done func() bool) error {
 			// Stop and let the caller's checks report what is missing.
 			t.Error("timed out waiting for the poller")
 			cancel()
-			return <-errCh
+			return waitStart(t, errCh)
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
 	cancel()
-	return <-errCh
+	return waitStart(t, errCh)
+}
+
+// waitStart waits for Start to return after its context is done.
+func waitStart(t *testing.T, errCh <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(startTimeout):
+		t.Fatal("Start did not return after its context was done")
+		return nil
+	}
 }
 
 // syncBuffer is a goroutine-safe log sink.
@@ -310,9 +333,13 @@ func TestPollerLooksUpLabelsForEachProject(t *testing.T) {
 
 		fake.mu.Lock()
 		filters := fake.listLabelFilters["proj-b"]
+		workItemRequests := fake.workItemRequests["proj-b"]
 		fake.mu.Unlock()
 		if len(filters) != 0 {
 			t.Errorf("proj-b: list requests sent with filters %v, want none", filters)
+		}
+		if workItemRequests != 0 {
+			t.Errorf("proj-b: work item requests = %d, want none", workItemRequests)
 		}
 
 		var warns int
@@ -340,7 +367,12 @@ func TestPollerLooksUpLabelsForEachProject(t *testing.T) {
 		handled := &handledSet{ids: make(map[string]bool)}
 		p := newTestPoller(srv.URL, []string{"proj-a", "proj-b"}, &logs, handled)
 
-		err := p.Start(context.Background())
+		ctx, cancel := context.WithTimeout(context.Background(), startTimeout)
+		defer cancel()
+		err := p.Start(ctx)
+		if ctx.Err() != nil {
+			t.Fatalf("Start did not return before its timeout: %v", ctx.Err())
+		}
 		if err == nil {
 			t.Fatal("Start returned nil, want error")
 		}
@@ -378,8 +410,8 @@ func TestPollerLooksUpLabelsForEachProject(t *testing.T) {
 			t.Errorf("proj-b label list requests = %d, want 3", got)
 		}
 		for _, f := range fake.listLabelFilters["proj-b"] {
-			if f != "b-pilot" {
-				t.Errorf("proj-b list request with label filter %q, want b-pilot", f)
+			if f != "b-pilot" && f != "b-in-progress" {
+				t.Errorf("proj-b list request with label filter %q, want b-pilot or b-in-progress", f)
 			}
 		}
 		if got := fake.patches["wi-b"]; len(got) != 3 || strings.Join(got[2], ",") != "b-pilot,b-done" {
@@ -397,4 +429,128 @@ func TestPollerLooksUpLabelsForEachProject(t *testing.T) {
 			t.Errorf("proj-b pickup info lines = %d, want 1\n%s", n, out)
 		}
 	})
+}
+
+func TestPollerUsesTheProjectOfTheList(t *testing.T) {
+	fake := newFakePlane(t)
+	fake.labels["proj-a"] = projectLabelsFor("a")
+	fake.labels["proj-b"] = projectLabelsFor("b")
+	// The list responses of proj-b carry no project key.
+	fake.items["proj-b"] = []WorkItem{
+		{ID: "wi-done", Name: "Done", LabelIDs: []string{"b-pilot", "b-done"}},
+		{ID: "wi-new", Name: "New", LabelIDs: []string{"b-pilot"}},
+	}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	var logs syncBuffer
+	handled := &handledSet{ids: make(map[string]bool)}
+	p := newTestPoller(srv.URL, []string{"proj-a", "proj-b"}, &logs, handled)
+
+	// Wait for wi-new to get its done label and for a few more polls of proj-b.
+	err := runPoller(t, p, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return handled.has("wi-new") && len(fake.patches["wi-new"]) >= 3 && len(fake.listLabelFilters["proj-b"]) >= 4
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	if handled.has("wi-done") {
+		t.Error("work item with the done label of the project of the list was given to the handler")
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	patches := fake.patches["wi-new"]
+	if len(patches) == 0 || strings.Join(patches[0], ",") != "b-pilot,b-in-progress" {
+		t.Errorf("wi-new patches = %v, want first patch b-pilot,b-in-progress", patches)
+	}
+	if got := fake.patches["wi-done"]; len(got) != 0 {
+		t.Errorf("wi-done patches = %v, want none", got)
+	}
+}
+
+func TestPollerRecoversOrphansOfAProjectFoundLater(t *testing.T) {
+	fake := newFakePlane(t)
+	fake.labels["proj-a"] = projectLabelsFor("a")
+	fake.labels["proj-b"] = projectLabelsFor("b")
+	fake.labelFailures["proj-b"] = 1 // start fails
+	// wi-b has the in-progress label of a run before the restart.
+	fake.items["proj-b"] = []WorkItem{{ID: "wi-b", Name: "B", ProjectID: "proj-b", LabelIDs: []string{"b-pilot", "b-in-progress"}}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	var logs syncBuffer
+	handled := &handledSet{ids: make(map[string]bool)}
+	p := newTestPoller(srv.URL, []string{"proj-a", "proj-b"}, &logs, handled)
+
+	err := runPoller(t, p, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return handled.has("wi-b") && len(fake.patches["wi-b"]) >= 4
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	// PATCHes: recovery removes in-progress, then add in-progress, remove in-progress, add done.
+	patches := fake.patches["wi-b"]
+	want := [][]string{
+		{"b-pilot"},
+		{"b-pilot", "b-in-progress"},
+		{"b-pilot"},
+		{"b-pilot", "b-done"},
+	}
+	if len(patches) != len(want) {
+		t.Fatalf("wi-b patches = %v, want %v", patches, want)
+	}
+	for i := range want {
+		if strings.Join(patches[i], ",") != strings.Join(want[i], ",") {
+			t.Errorf("wi-b patch %d labels = %v, want %v", i, patches[i], want[i])
+		}
+	}
+}
+
+func TestPollerWarnsOnceForEachKindOfLabelLookupFailure(t *testing.T) {
+	fake := newFakePlane(t)
+	fake.labels["proj-a"] = projectLabelsFor("a")
+	fake.labels["proj-b"] = []Label{{ID: "b-other", Name: "bug"}}
+	fake.labelFailures["proj-b"] = 2 // start + first poll fail
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	var logs syncBuffer
+	handled := &handledSet{ids: make(map[string]bool)}
+	p := newTestPoller(srv.URL, []string{"proj-a", "proj-b"}, &logs, handled)
+
+	// Two failed lists, then at least two lists with no pilot label.
+	err := runPoller(t, p, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return fake.labelListRequests["proj-b"] >= 4
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	out := logs.String()
+	for _, tc := range []struct {
+		line string
+		want int
+	}{
+		{`level=WARN msg="Failed to list labels for project" project_id=proj-b`, 1},
+		{`level=DEBUG msg="Failed to list labels for project" project_id=proj-b`, 1},
+		{`level=WARN msg="Pilot label not found in project; project is skipped" project_id=proj-b label=` + LabelPilot, 1},
+	} {
+		if n := strings.Count(out, tc.line); n != tc.want {
+			t.Errorf("count of %q = %d, want %d\n%s", tc.line, n, tc.want, out)
+		}
+	}
+	if n := strings.Count(out, `level=DEBUG msg="Pilot label not found in project; project is skipped" project_id=proj-b`); n < 1 {
+		t.Errorf("no repeat of the label not found line at Debug\n%s", out)
+	}
 }
