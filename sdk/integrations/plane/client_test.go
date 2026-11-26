@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -42,7 +43,7 @@ func TestListWorkItems(t *testing.T) {
 		{
 			name:     "without label filter",
 			labelID:  "",
-			wantPath: "/api/v1/workspaces/ws/projects/proj-1/work-items/",
+			wantPath: "/api/v1/workspaces/ws/projects/proj-1/work-items/?per_page=100",
 			items: []WorkItem{
 				{ID: "wi-1", Name: "First"},
 				{ID: "wi-2", Name: "Second"},
@@ -52,7 +53,7 @@ func TestListWorkItems(t *testing.T) {
 		{
 			name:     "with label filter",
 			labelID:  "lbl-abc",
-			wantPath: "/api/v1/workspaces/ws/projects/proj-1/work-items/?label=lbl-abc",
+			wantPath: "/api/v1/workspaces/ws/projects/proj-1/work-items/?label=lbl-abc&per_page=100",
 			items: []WorkItem{
 				{ID: "wi-3", Name: "Filtered"},
 			},
@@ -184,6 +185,150 @@ func TestListWorkItemsSkipsAnItemThatDoesNotDecode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestListWorkItemsReadsEveryPage(t *testing.T) {
+	type page struct {
+		items      []WorkItem
+		nextCursor string
+		nextPage   bool
+	}
+	tests := []struct {
+		name         string
+		pages        map[string]page // keyed by the cursor of the request ("" for the first)
+		endless      bool            // server always says there is a next page
+		wantIDs      []string
+		wantRequests int
+		wantCursors  []string
+		wantWarns    int
+	}{
+		{
+			name: "three pages",
+			pages: map[string]page{
+				"":        {items: []WorkItem{{ID: "wi-1"}, {ID: "wi-2"}}, nextCursor: "100:1:0", nextPage: true},
+				"100:1:0": {items: []WorkItem{{ID: "wi-3"}, {ID: "wi-4"}}, nextCursor: "100:2:0", nextPage: true},
+				"100:2:0": {items: []WorkItem{{ID: "wi-5"}}, nextCursor: "100:3:0", nextPage: false},
+			},
+			wantIDs:      []string{"wi-1", "wi-2", "wi-3", "wi-4", "wi-5"},
+			wantRequests: 3,
+			wantCursors:  []string{"", "100:1:0", "100:2:0"},
+		},
+		{
+			name: "one page with next_page_results false",
+			pages: map[string]page{
+				"": {items: []WorkItem{{ID: "wi-1"}}, nextCursor: "100:1:0", nextPage: false},
+			},
+			wantIDs:      []string{"wi-1"},
+			wantRequests: 1,
+			wantCursors:  []string{""},
+		},
+		{
+			name:         "server always has a next page",
+			endless:      true,
+			wantRequests: maxWorkItemPages,
+			wantWarns:    1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cursors []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				q := r.URL.Query()
+				if got := q.Get("label"); got != "lbl-abc" {
+					t.Errorf("request %d: label = %q, want %q", len(cursors)+1, got, "lbl-abc")
+				}
+				if got := q.Get("per_page"); got != "100" {
+					t.Errorf("request %d: per_page = %q, want %q", len(cursors)+1, got, "100")
+				}
+				cursor := q.Get("cursor")
+				cursors = append(cursors, cursor)
+
+				var resp paginatedResponse
+				if tt.endless {
+					n := len(cursors)
+					resp = paginatedResponse{
+						Results:         []WorkItem{{ID: "wi-" + strconv.Itoa(n)}},
+						NextCursor:      "100:" + strconv.Itoa(n) + ":0",
+						NextPageResults: true,
+					}
+				} else {
+					p, ok := tt.pages[cursor]
+					if !ok {
+						t.Errorf("unexpected cursor %q", cursor)
+					}
+					resp = paginatedResponse{Results: p.items, NextCursor: p.nextCursor, NextPageResults: p.nextPage}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(resp)
+			}))
+			defer srv.Close()
+
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			c := NewClient(srv.URL, testutil.FakePlaneAPIKey, WithClientLogger(logger))
+			items, err := c.ListWorkItems(context.Background(), "ws", "proj-1", "lbl-abc")
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if len(cursors) != tt.wantRequests {
+				t.Errorf("got %d requests, want %d", len(cursors), tt.wantRequests)
+			}
+			if tt.wantCursors != nil && strings.Join(cursors, ",") != strings.Join(tt.wantCursors, ",") {
+				t.Errorf("got cursors %q, want %q", cursors, tt.wantCursors)
+			}
+
+			gotIDs := make([]string, 0, len(items))
+			for _, it := range items {
+				gotIDs = append(gotIDs, it.ID)
+			}
+			if tt.endless {
+				if len(items) != maxWorkItemPages {
+					t.Errorf("got %d items, want the %d read before the limit", len(items), maxWorkItemPages)
+				}
+			} else if strings.Join(gotIDs, ",") != strings.Join(tt.wantIDs, ",") {
+				t.Errorf("got items %v, want %v", gotIDs, tt.wantIDs)
+			}
+
+			logOut := buf.String()
+			if got := strings.Count(logOut, "level=WARN"); got != tt.wantWarns {
+				t.Errorf("got %d Warn lines, want %d; log:\n%s", got, tt.wantWarns, logOut)
+			}
+			if tt.wantWarns > 0 {
+				for _, want := range []string{"project_id=proj-1", "page_limit=" + strconv.Itoa(maxWorkItemPages)} {
+					if !strings.Contains(logOut, want) {
+						t.Errorf("log does not contain %q; log:\n%s", want, logOut)
+					}
+				}
+			}
+		})
+	}
+
+	t.Run("error on a later page", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("cursor") != "" {
+				http.Error(w, "boom", http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(paginatedResponse{
+				Results:         []WorkItem{{ID: "wi-1"}},
+				NextCursor:      "100:1:0",
+				NextPageResults: true,
+			})
+		}))
+		defer srv.Close()
+
+		c := NewClient(srv.URL, testutil.FakePlaneAPIKey)
+		items, err := c.ListWorkItems(context.Background(), "ws", "proj-1", "")
+		if err == nil {
+			t.Fatal("expected error from the second page")
+		}
+		if items != nil {
+			t.Errorf("expected no partial result, got %d items", len(items))
+		}
+	})
 }
 
 func TestGetWorkItem(t *testing.T) {

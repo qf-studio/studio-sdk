@@ -142,8 +142,10 @@ type Comment struct {
 
 // paginatedResponse wraps paginated API responses from Plane.
 type paginatedResponse struct {
-	Results    []WorkItem `json:"results"`
-	TotalCount int        `json:"total_count"`
+	Results         []WorkItem `json:"results"`
+	TotalCount      int        `json:"total_count"`
+	NextCursor      string     `json:"next_cursor"`
+	NextPageResults bool       `json:"next_page_results"`
 }
 
 // statesResponse wraps the states list API response.
