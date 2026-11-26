@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ type Client struct {
 	httpClient       *http.Client
 	workspaceSlug    string // optional: used by CreateIssue (SubIssueCreator)
 	defaultProjectID string // optional: fallback project for CreateIssue
+	logger           *slog.Logger
 }
 
 // ClientOption configures the Client.
@@ -47,6 +49,13 @@ func WithDefaultProjectID(projectID string) ClientOption {
 	}
 }
 
+// WithClientLogger sets the logger for the client.
+func WithClientLogger(logger *slog.Logger) ClientOption {
+	return func(c *Client) {
+		c.logger = logger
+	}
+}
+
 // NewClient creates a new Plane API client.
 // baseURL should be e.g. "https://api.plane.so" (no trailing slash).
 func NewClient(baseURL, apiKey string, opts ...ClientOption) *Client {
@@ -57,6 +66,7 @@ func NewClient(baseURL, apiKey string, opts ...ClientOption) *Client {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		logger: slog.Default(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -141,11 +151,39 @@ func (c *Client) ListWorkItems(ctx context.Context, workspaceSlug, projectID, la
 		path += "?label=" + labelID
 	}
 
-	var resp paginatedResponse
+	// Decode the page item by item so one work item that does not decode
+	// is skipped instead of failing the whole page.
+	var resp struct {
+		Results json.RawMessage `json:"results"`
+	}
 	if err := c.doRequest(ctx, http.MethodGet, path, nil, &resp); err != nil {
 		return nil, err
 	}
-	return resp.Results, nil
+	if len(resp.Results) == 0 || string(resp.Results) == "null" {
+		return nil, fmt.Errorf("failed to parse response: no results array")
+	}
+	var raws []json.RawMessage
+	if err := json.Unmarshal(resp.Results, &raws); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w", err)
+	}
+
+	items := make([]WorkItem, 0, len(raws))
+	for _, raw := range raws {
+		var item WorkItem
+		if err := json.Unmarshal(raw, &item); err != nil {
+			var ref struct {
+				ID string `json:"id"`
+			}
+			_ = json.Unmarshal(raw, &ref)
+			c.logger.Warn("Skipping Plane work item that does not decode",
+				slog.String("project_id", projectID),
+				slog.String("work_item_id", ref.ID),
+				slog.Any("error", err))
+			continue
+		}
+		items = append(items, item)
+	}
+	return items, nil
 }
 
 // GetWorkItem fetches a single work item by ID.

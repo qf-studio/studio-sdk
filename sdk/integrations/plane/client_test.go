@@ -1,10 +1,13 @@
 package plane
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
@@ -80,6 +83,104 @@ func TestListWorkItems(t *testing.T) {
 			}
 			if len(items) != tt.wantCount {
 				t.Errorf("got %d items, want %d", len(items), tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestListWorkItemsSkipsAnItemThatDoesNotDecode(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		wantIDs   []string
+		wantWarns int
+		wantInLog string
+		wantErr   bool
+	}{
+		{
+			name: "second item has a field of a wrong type",
+			body: `{"results":[` +
+				`{"id":"wi-1","name":"First","priority":"high"},` +
+				`{"id":"wi-2","name":42,"priority":"low"},` +
+				`{"id":"wi-3","name":"Third","priority":3}` +
+				`],"total_count":3}`,
+			wantIDs:   []string{"wi-1", "wi-3"},
+			wantWarns: 1,
+			wantInLog: "work_item_id=wi-2",
+		},
+		{
+			name: "no broken item",
+			body: `{"results":[` +
+				`{"id":"wi-1","name":"First"},` +
+				`{"id":"wi-2","name":"Second"},` +
+				`{"id":"wi-3","name":"Third"}` +
+				`],"total_count":3}`,
+			wantIDs: []string{"wi-1", "wi-2", "wi-3"},
+		},
+		{
+			name:    "broken JSON",
+			body:    `{"results":[{"id":"wi-1"`,
+			wantErr: true,
+		},
+		{
+			name:    "no results array",
+			body:    `{"total_count":0}`,
+			wantErr: true,
+		},
+		{
+			name:    "results is not an array",
+			body:    `{"results":{"id":"wi-1"}}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("X-API-Key") != testutil.FakePlaneAPIKey {
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer srv.Close()
+
+			var buf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&buf, nil))
+			c := NewClient(srv.URL, testutil.FakePlaneAPIKey, WithClientLogger(logger))
+			items, err := c.ListWorkItems(context.Background(), "ws", "proj-1", "")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %d items", len(items))
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			gotIDs := make([]string, 0, len(items))
+			for _, it := range items {
+				gotIDs = append(gotIDs, it.ID)
+			}
+			if strings.Join(gotIDs, ",") != strings.Join(tt.wantIDs, ",") {
+				t.Errorf("got items %v, want %v", gotIDs, tt.wantIDs)
+			}
+
+			logOut := buf.String()
+			if got := strings.Count(logOut, "level=WARN"); got != tt.wantWarns {
+				t.Errorf("got %d Warn lines, want %d; log:\n%s", got, tt.wantWarns, logOut)
+			}
+			if tt.wantInLog != "" {
+				for _, want := range []string{tt.wantInLog, "project_id=proj-1", "error="} {
+					if !strings.Contains(logOut, want) {
+						t.Errorf("log does not contain %q; log:\n%s", want, logOut)
+					}
+				}
+				if strings.Contains(logOut, `"name":42`) {
+					t.Errorf("log holds the raw JSON of the item; log:\n%s", logOut)
+				}
 			}
 		})
 	}
