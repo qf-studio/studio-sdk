@@ -18,6 +18,12 @@ type Config struct {
 	ProjectIDs    []string       `yaml:"project_ids"`
 	TriggerLabel  string         `yaml:"trigger_label"` // Label that marks a work item for the host to pick up (default: "pilot")
 	Polling       *PollingConfig `yaml:"polling,omitempty"`
+	// CompletedStateAtMerge makes the poller built by Adapter.NewPoller leave
+	// the state of a work item alone when a successful run opened a pull
+	// request; the caller sets the completed state at the merge (see
+	// WithCompletedStateAtMerge). The default (false) keeps the behaviour of
+	// today: a successful run moves the work item to the completed state.
+	CompletedStateAtMerge bool `yaml:"completed_state_at_merge"`
 }
 
 // PollingConfig holds polling configuration for the Plane adapter.
