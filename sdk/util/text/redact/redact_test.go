@@ -53,8 +53,8 @@ func TestError_MasksText(t *testing.T) {
 
 func TestError_KeepsIsAndAs(t *testing.T) {
 	sentinel := errors.New("sentinel")
-	pathErr := &fs.PathError{Op: "open", Path: "/SECRET", Err: sentinel}
-	err := Error(fmt.Errorf("wrap: %w", pathErr), "SECRET")
+	pathErr := &fs.PathError{Op: "open", Path: "/data/file", Err: sentinel}
+	err := Error(fmt.Errorf("wrap SECRET: %w", pathErr), "SECRET")
 
 	if !errors.Is(err, sentinel) {
 		t.Error("errors.Is(err, sentinel) = false, want true")
@@ -68,10 +68,33 @@ func TestError_KeepsIsAndAs(t *testing.T) {
 	}
 }
 
-// customErr is a custom error type for the errors.As test.
+func TestError_AsRefusesSecretInPathError(t *testing.T) {
+	sentinel := errors.New("sentinel")
+	pathErr := &fs.PathError{Op: "open", Path: "/SECRET", Err: sentinel}
+	err := Error(fmt.Errorf("wrap: %w", pathErr), "SECRET")
+
+	if !errors.Is(err, sentinel) {
+		t.Error("errors.Is(err, sentinel) = false, want true")
+	}
+	var target *fs.PathError
+	if errors.As(err, &target) {
+		t.Fatalf("errors.As(err, *fs.PathError) = true with %q, want false", target.Error())
+	}
+	if target != nil {
+		t.Errorf("target = %v, want nil", target)
+	}
+}
+
+// customErr is a custom error type for the errors.As test; its text holds the
+// secret.
 type customErr struct{ code int }
 
 func (e *customErr) Error() string { return fmt.Sprintf("custom %d SECRET", e.code) }
+
+// apiErr is a custom error type whose text is its Body field.
+type apiErr struct{ Body string }
+
+func (e *apiErr) Error() string { return "api: " + e.Body }
 
 func TestError_IsSentinelInCause(t *testing.T) {
 	sentinel := errors.New("sentinel")
@@ -84,15 +107,72 @@ func TestError_IsSentinelInCause(t *testing.T) {
 	}
 }
 
-func TestError_AsCustomType(t *testing.T) {
-	cause := &customErr{code: 7}
-	err := Error(fmt.Errorf("wrap: %w", cause), "SECRET")
+func TestError_AsCustomTypeWithSecret(t *testing.T) {
+	err := Error(fmt.Errorf("wrap: %w", &customErr{code: 7}), "SECRET")
 	var target *customErr
-	if !errors.As(err, &target) {
-		t.Fatal("errors.As(err, *customErr) = false, want true")
+	if errors.As(err, &target) {
+		t.Fatalf("errors.As(err, *customErr) = true with %q, want false", target.Error())
 	}
-	if target != cause || target.code != 7 {
+	if target != nil {
+		t.Errorf("target = %v, want nil", target)
+	}
+}
+
+func TestError_AsCustomTypeWithSecretInField(t *testing.T) {
+	err := Error(fmt.Errorf("wrap: %w", &apiErr{Body: "echo SECRET"}), "SECRET")
+	var target *apiErr
+	if errors.As(err, &target) {
+		t.Fatalf("errors.As(err, *apiErr) = true with Body %q, want false", target.Body)
+	}
+	if target != nil {
+		t.Errorf("target = %v, want nil", target)
+	}
+}
+
+func TestError_AsCustomTypeWithoutSecret(t *testing.T) {
+	cause := &apiErr{Body: "not found"}
+	err := Error(fmt.Errorf("wrap SECRET: %w", cause), "SECRET")
+	var target *apiErr
+	if !errors.As(err, &target) {
+		t.Fatal("errors.As(err, *apiErr) = false, want true")
+	}
+	if target != cause {
 		t.Errorf("errors.As gave %v, want %v", target, cause)
+	}
+}
+
+// TestError_AsUnwrapInterface uses the chain the Telegram client builds:
+// fmt.Errorf("failed to get updates: %w", *url.Error). The fmt wrapper is the
+// first match for an Unwrap interface target, and its text holds the secret.
+func TestError_AsUnwrapInterface(t *testing.T) {
+	inner := fmt.Errorf("dial https://host/botSECRET/x: %w", errors.New("refused"))
+	orig := &url.Error{Op: "Get", URL: "https://host/botSECRET/getUpdates", Err: inner}
+	err := Error(fmt.Errorf("failed to get updates: %w", orig), "SECRET")
+
+	var u interface{ Unwrap() error }
+	if !errors.As(err, &u) {
+		return
+	}
+	// As answered true: no error in the chain of the value may hold the secret.
+	for e := error(u.(error)); e != nil; e = errors.Unwrap(e) {
+		if strings.Contains(e.Error(), "SECRET") {
+			t.Fatalf("errors.As(err, Unwrap iface) gave %T with text %q", e, e.Error())
+		}
+	}
+}
+
+func TestError_FormatHidesSecrets(t *testing.T) {
+	err := Error(fmt.Errorf("get https://host/botSECRET/x: %w", errors.New("dial")), "SECRET")
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%q", "%d", "%x"} {
+		got := fmt.Sprintf(verb, err)
+		if strings.Contains(got, "SECRET") {
+			t.Errorf("Sprintf(%s) = %q, holds the secret", verb, got)
+		}
+		if verb == "%v" || verb == "%+v" || verb == "%s" {
+			if got != err.Error() {
+				t.Errorf("Sprintf(%s) = %q, want %q", verb, got, err.Error())
+			}
+		}
 	}
 }
 
