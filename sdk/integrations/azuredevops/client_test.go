@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -506,4 +507,35 @@ func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
 	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 	basic := base64.StdEncoding.EncodeToString([]byte(":" + testutil.CanaryToken))
 	testutil.AssertNoCanaryLeak(t, basic, texts...)
+}
+
+// mutation pin: NewClientWithConfig drops its ClientOptions -> this test fails
+func TestNewClientWithConfig_AppliesOptions(t *testing.T) {
+	hc := &http.Client{}
+	config := &Config{PAT: testutil.FakeAzureDevOpsPAT, Organization: "org", Project: "proj"}
+
+	client := NewClientWithConfig(config, WithHTTPClient(hc))
+
+	if client.httpClient != hc {
+		t.Error("expected NewClientWithConfig to apply WithHTTPClient")
+	}
+}
+
+// mutation pin: secrets() returns base64(":") for an empty PAT -> this test fails
+func TestDoRequest_EmptyPATDoesNotMaskBasicOfEmpty(t *testing.T) {
+	empty := base64.StdEncoding.EncodeToString([]byte(":"))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("value " + empty))
+	}))
+	defer server.Close()
+
+	client := NewClientWithBaseURL("", "org", "proj", server.URL)
+	_, err := client.GetWorkItem(context.Background(), 42)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "value "+empty) {
+		t.Errorf("expected %q to stay unmasked, got %v", empty, err)
+	}
 }

@@ -773,3 +773,21 @@ func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
 	basic := base64.StdEncoding.EncodeToString([]byte(testutil.FakeJiraUsername + ":" + testutil.CanaryToken))
 	testutil.AssertNoCanaryLeak(t, basic, texts...)
 }
+
+// mutation pin: RateLimitError takes the unmasked response text -> this test fails
+func TestCanary_RateLimitErrorDoesNotLeakCredential(t *testing.T) {
+	srv := testutil.EchoServer(t, http.StatusTooManyRequests)
+	client := NewClient(srv.URL, testutil.FakeJiraUsername, testutil.CanaryToken, PlatformCloud)
+	client.retryOpts = RetryOptions{MaxRetries: 1, BaseDelay: 1 * time.Millisecond, MaxDelay: 10 * time.Millisecond}
+
+	_, err := client.GetIssue(context.Background(), "PROJ-1")
+	var rateErr *RateLimitError
+	if !errors.As(err, &rateErr) {
+		t.Fatalf("errors.As(err, *RateLimitError) = false; err = %v", err)
+	}
+	texts := []string{testutil.ErrText(t, err), rateErr.Error(), rateErr.Message}
+
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
+	basic := base64.StdEncoding.EncodeToString([]byte(testutil.FakeJiraUsername + ":" + testutil.CanaryToken))
+	testutil.AssertNoCanaryLeak(t, basic, texts...)
+}
