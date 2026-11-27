@@ -3,10 +3,12 @@ package slack
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -388,4 +390,45 @@ func TestMessageJSONRoundTrip(t *testing.T) {
 	if len(decoded.Blocks) != len(original.Blocks) {
 		t.Errorf("Blocks len = %d, want %d", len(decoded.Blocks), len(original.Blocks))
 	}
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the bot token and drives PostMessage and UpdateMessage (the client has no
+// read method) through a failing transport and through an echo server that
+// answers 401 and 500. No error text and no captured log line may hold the
+// canary.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	msg := &Message{Channel: "C123", Text: "hi"}
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+
+	failing := NewClient(testutil.CanaryToken,
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.PostMessage(ctx, msg)
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	err = failing.UpdateMessage(ctx, "C123", "1234.5678", msg)
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(testutil.CanaryToken, srv.URL)
+		_, err := echo.PostMessage(ctx, msg)
+		collect(err)
+		err = echo.UpdateMessage(ctx, "C123", "1234.5678", msg)
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }

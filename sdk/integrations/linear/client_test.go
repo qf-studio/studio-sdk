@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -1223,4 +1225,45 @@ func TestGetTeamDoneStateID_Cache(t *testing.T) {
 	if callCount != 2 {
 		t.Errorf("expected 2 HTTP calls after third request (different team), got %d", callCount)
 	}
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the API key and drives GetIssue and AddComment through a failing transport
+// and through an echo server that answers 401 and 500. No error text and no
+// captured log line may hold the canary. The client returns no error type of
+// its own (GraphQLError is not an error), so there is no value for errors.As
+// to hand out beyond the *url.Error.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+
+	failing := NewClient(testutil.CanaryToken,
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetIssue(ctx, "ENG-1")
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	err = failing.AddComment(ctx, "ENG-1", "hi")
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(testutil.CanaryToken, srv.URL)
+		_, err := echo.GetIssue(ctx, "ENG-1")
+		collect(err)
+		err = echo.AddComment(ctx, "ENG-1", "hi")
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }

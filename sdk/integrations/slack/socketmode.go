@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 // wsDialer abstracts WebSocket dialing for testing.
@@ -277,19 +279,41 @@ type SocketModeClient struct {
 	log        *slog.Logger
 }
 
+// SocketModeOption configures a SocketModeClient.
+type SocketModeOption func(*SocketModeClient)
+
+// WithSocketModeAPIURL overrides the Slack Web API base URL used for
+// apps.connections.open (for tests).
+func WithSocketModeAPIURL(apiURL string) SocketModeOption {
+	return func(s *SocketModeClient) {
+		s.apiURL = apiURL
+	}
+}
+
+// WithSocketModeHTTPClient overrides the default HTTP client.
+func WithSocketModeHTTPClient(hc *http.Client) SocketModeOption {
+	return func(s *SocketModeClient) {
+		s.httpClient = hc
+	}
+}
+
 // NewSocketModeClient creates a Socket Mode client for the given app token.
 // logger may be nil to use slog.Default().
-func NewSocketModeClient(appToken string, logger *slog.Logger) *SocketModeClient {
+func NewSocketModeClient(appToken string, logger *slog.Logger, opts ...SocketModeOption) *SocketModeClient {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SocketModeClient{
+	s := &SocketModeClient{
 		appToken:   appToken,
 		apiURL:     slackAPIURL,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		dialer:     defaultDialer{},
 		log:        logger,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // OpenConnection calls apps.connections.open with the app-level token and
@@ -304,7 +328,7 @@ func (s *SocketModeClient) OpenConnection(ctx context.Context) (string, error) {
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", ErrConnectionOpen, err)
+		return "", s.redactErr(fmt.Errorf("%w: %w", ErrConnectionOpen, err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -314,7 +338,7 @@ func (s *SocketModeClient) OpenConnection(ctx context.Context) (string, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("%w: HTTP %d: %s", ErrConnectionOpen, resp.StatusCode, string(body))
+		return "", fmt.Errorf("%w: HTTP %d: %s", ErrConnectionOpen, resp.StatusCode, redact.Text(string(body), s.appToken))
 	}
 
 	var result connectionsOpenResponse
@@ -327,7 +351,7 @@ func (s *SocketModeClient) OpenConnection(ctx context.Context) (string, error) {
 		case "invalid_auth", "not_authed", "account_inactive", "token_revoked":
 			return "", fmt.Errorf("%w: %s", ErrAuthFailure, result.Error)
 		default:
-			return "", fmt.Errorf("%w: %s", ErrConnectionOpen, result.Error)
+			return "", fmt.Errorf("%w: %s", ErrConnectionOpen, redact.Text(result.Error, s.appToken))
 		}
 	}
 
@@ -336,6 +360,14 @@ func (s *SocketModeClient) OpenConnection(ctx context.Context) (string, error) {
 	}
 
 	return result.URL, nil
+}
+
+// redactErr masks the app token in err. The token is sent in the
+// Authorization header, and a transport error can print the request it
+// failed on. errors.Is (for ErrConnectionOpen) and errors.As on the returned
+// error keep their results; a *url.Error they hand out is masked too.
+func (s *SocketModeClient) redactErr(err error) error {
+	return redact.Error(err, s.appToken)
 }
 
 // Listen establishes the Socket Mode connection and returns a channel of raw

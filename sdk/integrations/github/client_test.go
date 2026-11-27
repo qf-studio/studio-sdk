@@ -4347,3 +4347,86 @@ func TestSearchMergedPRsForIssue_IgnoresBareNumberInTitle(t *testing.T) {
 		})
 	}
 }
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the token and drives GetIssue and AddComment (doRequest), ExecuteGraphQL
+// and GetJobLogs — the three request sites — through a failing transport and
+// through an echo server that answers 401 and 500. No error text and no
+// captured log line may hold the canary, and neither may the *AuthError that
+// errors.As hands out for the 401 answer, nor the *PartialGraphQLError of a
+// GraphQL answer whose errors echo the Authorization header.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+	collectAuthErr := func(err error) {
+		t.Helper()
+		var authErr *AuthError
+		if !errors.As(err, &authErr) {
+			t.Fatalf("errors.As(err, *AuthError) = false; err = %v", err)
+		}
+		texts = append(texts, authErr.Error(), authErr.Message)
+	}
+
+	failing := NewClientWithBaseURL(testutil.CanaryToken, "https://api.github.invalid",
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetIssue(ctx, "owner", "repo", 42)
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	_, err = failing.AddComment(ctx, "owner", "repo", 42, "hi")
+	collect(err)
+	collect(failing.ExecuteGraphQL(ctx, "query { viewer { login } }", nil, nil))
+	_, err = failing.GetJobLogs(ctx, "owner", "repo", 7)
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(testutil.CanaryToken, srv.URL)
+		_, err := echo.GetIssue(ctx, "owner", "repo", 42)
+		collect(err)
+		if status == http.StatusUnauthorized {
+			collectAuthErr(err)
+		}
+		_, err = echo.AddComment(ctx, "owner", "repo", 42, "hi")
+		collect(err)
+		err = echo.ExecuteGraphQL(ctx, "query { viewer { login } }", nil, nil)
+		collect(err)
+		if status == http.StatusUnauthorized {
+			collectAuthErr(err)
+		}
+		_, err = echo.GetJobLogs(ctx, "owner", "repo", 7)
+		collect(err)
+	}
+
+	gqlSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(GraphQLResponse{
+			Data:   json.RawMessage(`{}`),
+			Errors: []GraphQLError{{Message: "not found: " + auth, Type: "NOT_FOUND", Path: []interface{}{"node", auth}}},
+		})
+	}))
+	defer gqlSrv.Close()
+	gql := NewClientWithBaseURL(testutil.CanaryToken, gqlSrv.URL)
+	err = gql.ExecuteGraphQLTolerant(ctx, "query { node(id: \"x\") { id } }", nil, nil)
+	collect(err)
+	var partialErr *PartialGraphQLError
+	if !errors.As(err, &partialErr) {
+		t.Fatalf("errors.As(err, *PartialGraphQLError) = false; err = %v", err)
+	}
+	for _, ge := range partialErr.Errors {
+		texts = append(texts, ge.String(), ge.Message, ge.Type, fmt.Sprint(ge.Path...))
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
+}

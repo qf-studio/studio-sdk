@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 // Client is a Discord REST API client with rate limit handling.
@@ -28,6 +30,13 @@ type Option func(*Client)
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Client) {
 		c.log = logger
+	}
+}
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) {
+		c.httpClient = hc
 	}
 }
 
@@ -98,7 +107,7 @@ func (c *Client) doRequest(ctx context.Context, method, endpoint string, body in
 		}
 
 		if statusCode >= 400 {
-			return nil, fmt.Errorf("discord API error: HTTP %d: %s", statusCode, string(respBody))
+			return nil, fmt.Errorf("discord API error: HTTP %d: %s", statusCode, redact.Text(string(respBody), c.botToken))
 		}
 
 		return respBody, nil
@@ -129,7 +138,7 @@ func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, bod
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, 0, 0, fmt.Errorf("send request: %w", err)
+		return nil, 0, 0, c.redactErr(fmt.Errorf("send request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -144,6 +153,14 @@ func (c *Client) doRequestOnce(ctx context.Context, method, endpoint string, bod
 	}
 
 	return respBody, resp.StatusCode, retryAfter, nil
+}
+
+// redactErr masks the bot token in err. The token is sent in the
+// Authorization header, and a transport error can print the request it
+// failed on. errors.Is and errors.As on the returned error keep their
+// results; a *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.botToken)
 }
 
 // parseRetryAfter extracts the wait duration from the Retry-After header.

@@ -1,15 +1,20 @@
 package slack
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"github.com/qf-studio/studio-sdk/sdk/testutil"
 )
 
 func TestSocketModeHandler_Disconnect(t *testing.T) {
@@ -109,4 +114,43 @@ type testWriter struct{ t *testing.T }
 func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Log(strings.TrimSpace(string(p)))
 	return len(p), nil
+}
+
+// TestCanary_SocketModeDoesNotLeakCredential builds the Socket Mode client
+// with the canary as the app token and drives OpenConnection through a
+// failing transport and through an echo server that answers 401 and 500. No
+// error text and no captured log line may hold the canary, and each error
+// still matches ErrConnectionOpen.
+func TestCanary_SocketModeDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+		if !errors.Is(err, ErrConnectionOpen) {
+			t.Errorf("errors.Is(err, ErrConnectionOpen) = false; err = %v", err)
+		}
+	}
+
+	failing := NewSocketModeClient(testutil.CanaryToken, nil,
+		WithSocketModeHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.OpenConnection(ctx)
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewSocketModeClient(testutil.CanaryToken, nil, WithSocketModeAPIURL(srv.URL))
+		_, err := echo.OpenConnection(ctx)
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }
