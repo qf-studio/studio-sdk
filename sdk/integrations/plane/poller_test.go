@@ -36,6 +36,10 @@ type fakePlane struct {
 	listLabelFilters map[string][]string
 	// work item ID → label IDs set by each PATCH request
 	patches map[string][][]string
+	// project ID → states
+	states map[string][]State
+	// work item ID → state ID set by each PATCH request
+	statePatches map[string][]string
 }
 
 func newFakePlane(t *testing.T) *fakePlane {
@@ -48,6 +52,8 @@ func newFakePlane(t *testing.T) *fakePlane {
 		workItemRequests:  make(map[string]int),
 		listLabelFilters:  make(map[string][]string),
 		patches:           make(map[string][][]string),
+		states:            make(map[string][]State),
+		statePatches:      make(map[string][]string),
 	}
 }
 
@@ -87,7 +93,7 @@ func (f *fakePlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(labelsResponse{Results: f.labels[projectID]})
 
 	case resource == "states":
-		_ = json.NewEncoder(w).Encode(statesResponse{})
+		_ = json.NewEncoder(w).Encode(statesResponse{Results: f.states[projectID]})
 
 	case resource == "work-items" && len(parts) == 7 && r.Method == http.MethodGet:
 		label := r.URL.Query().Get("label")
@@ -117,13 +123,20 @@ func (f *fakePlane) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(f.items[projectID][idx])
 		case http.MethodPatch:
 			var body struct {
-				Labels []string `json:"labels"`
+				Labels *[]string `json:"labels"`
+				State  *string   `json:"state"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				f.t.Errorf("decode patch body: %v", err)
 			}
-			f.items[projectID][idx].LabelIDs = body.Labels
-			f.patches[id] = append(f.patches[id], body.Labels)
+			if body.Labels != nil {
+				f.items[projectID][idx].LabelIDs = *body.Labels
+				f.patches[id] = append(f.patches[id], *body.Labels)
+			}
+			if body.State != nil {
+				f.items[projectID][idx].StateID = *body.State
+				f.statePatches[id] = append(f.statePatches[id], *body.State)
+			}
 			_ = json.NewEncoder(w).Encode(f.items[projectID][idx])
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -552,5 +565,116 @@ func TestPollerWarnsOnceForEachKindOfLabelLookupFailure(t *testing.T) {
 	}
 	if n := strings.Count(out, `level=DEBUG msg="Pilot label not found in project; project is skipped" project_id=proj-b`); n < 1 {
 		t.Errorf("no repeat of the label not found line at Debug\n%s", out)
+	}
+}
+
+// runCompletedStateCase runs one work item through a poller with the given
+// options and a handler that returns a successful result with prNumber. It
+// returns the state IDs set on the work item, its label patches, and the
+// number of OnPRCreated calls.
+func runCompletedStateCase(t *testing.T, prNumber int, opts ...PollerOption) (states []string, patches [][]string, prCreated int) {
+	t.Helper()
+	fake := newFakePlane(t)
+	fake.labels["proj-a"] = projectLabelsFor("a")
+	fake.states["proj-a"] = []State{
+		{ID: "a-started", Name: "In Progress", Group: StateGroupStarted},
+		{ID: "a-completed", Name: "Done", Group: StateGroupCompleted},
+	}
+	fake.items["proj-a"] = []WorkItem{{ID: "wi-1", Name: "One", ProjectID: "proj-a", LabelIDs: []string{"a-pilot"}}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	var logs syncBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	client := NewClient(srv.URL, testutil.FakePlaneAPIKey, WithClientLogger(logger))
+	cfg := &Config{WorkspaceSlug: "ws", ProjectIDs: []string{"proj-a"}}
+
+	var mu sync.Mutex
+	opts = append([]PollerOption{
+		WithPollerLogger(logger),
+		WithOnIssue(func(_ context.Context, _ *WorkItem) (*core.IssueResult, error) {
+			return &core.IssueResult{Success: true, PRNumber: prNumber, PRURL: "https://example.test/pr"}, nil
+		}),
+		WithOnPRCreated(func(core.PRCreatedEvent) {
+			mu.Lock()
+			prCreated++
+			mu.Unlock()
+		}),
+	}, opts...)
+	p := NewPoller(client, cfg, 10*time.Millisecond, opts...)
+
+	// The run is finished when the done label is set.
+	err := runPoller(t, p, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return HasLabelID(&fake.items["proj-a"][0], "a-done")
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Start waits for the active run, so the last state update is in.
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]string(nil), fake.statePatches["wi-1"]...), append([][]string(nil), fake.patches["wi-1"]...), prCreated
+}
+
+func countState(states []string, id string) int {
+	n := 0
+	for _, s := range states {
+		if s == id {
+			n++
+		}
+	}
+	return n
+}
+
+func TestPollerCompletedStateAtMerge_PRLeavesStateAlone(t *testing.T) {
+	states, patches, prCreated := runCompletedStateCase(t, 42, WithCompletedStateAtMerge())
+
+	if n := countState(states, "a-completed"); n != 0 {
+		t.Errorf("completed state requests = %d (states %v), want 0", n, states)
+	}
+	if n := countState(states, "a-started"); n != 1 {
+		t.Errorf("started state requests = %d (states %v), want 1", n, states)
+	}
+	want := [][]string{
+		{"a-pilot", "a-in-progress"},
+		{"a-pilot"},
+		{"a-pilot", "a-done"},
+	}
+	if len(patches) != len(want) {
+		t.Fatalf("label patches = %v, want %v", patches, want)
+	}
+	for i := range want {
+		if strings.Join(patches[i], ",") != strings.Join(want[i], ",") {
+			t.Errorf("label patch %d = %v, want %v", i, patches[i], want[i])
+		}
+	}
+	if prCreated != 1 {
+		t.Errorf("OnPRCreated calls = %d, want 1", prCreated)
+	}
+}
+
+func TestPollerCompletedStateAtMerge_NoPRStillCompletes(t *testing.T) {
+	states, _, prCreated := runCompletedStateCase(t, 0, WithCompletedStateAtMerge())
+
+	if n := countState(states, "a-completed"); n != 1 {
+		t.Errorf("completed state requests = %d (states %v), want 1", n, states)
+	}
+	if prCreated != 0 {
+		t.Errorf("OnPRCreated calls = %d, want 0", prCreated)
+	}
+}
+
+func TestPollerCompletedStateDefault_Unchanged(t *testing.T) {
+	states, _, prCreated := runCompletedStateCase(t, 42)
+
+	if n := countState(states, "a-completed"); n != 1 {
+		t.Errorf("completed state requests = %d (states %v), want 1", n, states)
+	}
+	if prCreated != 1 {
+		t.Errorf("OnPRCreated calls = %d, want 1", prCreated)
 	}
 }
