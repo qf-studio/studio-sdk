@@ -56,6 +56,10 @@ type Poller struct {
 	onPRCreated func(ev core.PRCreatedEvent)
 	logger      *slog.Logger
 
+	// completedStateAtMerge leaves the state of a work item alone when the
+	// run opened a pull request; the caller sets the completed state at the merge.
+	completedStateAtMerge bool
+
 	// Label UUID cache (resolved by name on startup, and at each poll for
 	// projects that have no set yet). Plane labels are per-project, so the
 	// same label name has another UUID in each project.
@@ -121,6 +125,22 @@ func WithMaxConcurrent(n int) PollerOption {
 func WithOnPRCreated(fn func(ev core.PRCreatedEvent)) PollerOption {
 	return func(p *Poller) {
 		p.onPRCreated = fn
+	}
+}
+
+// WithCompletedStateAtMerge makes the poller leave the state of a work item
+// alone when a successful run opened a pull request (PRNumber above zero). The
+// caller then moves the work item to the completed state when the pull request
+// merges; the SDK has no merge event. A successful run with no pull request
+// still moves the work item to the completed state.
+//
+// The labels do not change with this option: the in-progress label is removed
+// and the done label is added as before. The done label keeps its meaning "the
+// run is finished", and the poller skips a work item with a status label, so
+// the work item does not run a second time while its pull request is open.
+func WithCompletedStateAtMerge() PollerOption {
+	return func(p *Poller) {
+		p.completedStateAtMerge = true
 	}
 }
 
@@ -548,8 +568,8 @@ func (p *Poller) processIssueAsync(ctx context.Context, item WorkItem) {
 		_ = p.client.AddLabel(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, labels.done)
 	}
 
-	// Transition to completed state on success
-	if result != nil && result.Success {
+	// Transition to completed state on success, unless the caller sets it at the merge
+	if result != nil && result.Success && !(p.completedStateAtMerge && result.PRNumber > 0) {
 		if stateID := p.completedStateIDs[item.ProjectID]; stateID != "" {
 			if err := p.client.UpdateIssueState(ctx, p.config.WorkspaceSlug, item.ProjectID, item.ID, stateID); err != nil {
 				p.logger.Warn("Failed to transition work item to completed state",
