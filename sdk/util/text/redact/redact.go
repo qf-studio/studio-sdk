@@ -5,6 +5,7 @@ package redact
 import (
 	"errors"
 	"net/url"
+	"reflect"
 	"strings"
 )
 
@@ -29,8 +30,9 @@ func Text(s string, secrets ...string) string {
 // The returned error does not unwrap to err: the text of each cause can still
 // hold the secret, so a host that walks the chain would get it. errors.Is and
 // errors.As on the returned error answer as they would on err. A *url.Error
-// that errors.As hands out is a copy whose URL is masked and whose Err is
-// masked with Error; err itself is not changed.
+// that errors.As hands out, for a *url.Error target or an interface target
+// such as net.Error, is a copy whose URL is masked and whose Err is masked
+// with Error; err itself is not changed.
 func Error(err error, secrets ...string) error {
 	if err == nil {
 		return nil
@@ -50,16 +52,19 @@ func (e *redactedError) Error() string { return e.msg }
 func (e *redactedError) Is(target error) bool { return errors.Is(e.err, target) }
 
 // As finds the first error in the cause chain that matches target. A
-// *url.Error is handed out as a masked copy.
+// *url.Error is handed out as a masked copy, whether target points to a
+// *url.Error or to an interface type it satisfies (such as net.Error).
 func (e *redactedError) As(target any) bool {
 	if !errors.As(e.err, target) {
 		return false
 	}
-	if p, ok := target.(**url.Error); ok && *p != nil {
-		masked := **p
+	// errors.As has checked that target is a non-nil pointer.
+	v := reflect.ValueOf(target).Elem()
+	if u, ok := v.Interface().(*url.Error); ok && u != nil {
+		masked := *u
 		masked.URL = Text(masked.URL, e.secrets...)
 		masked.Err = Error(masked.Err, e.secrets...)
-		*p = &masked
+		v.Set(reflect.ValueOf(&masked))
 	}
 	return true
 }

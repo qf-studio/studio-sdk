@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"net/url"
 	"strings"
 	"testing"
@@ -125,6 +126,35 @@ func TestError_AsURLErrorIsMasked(t *testing.T) {
 
 	// The original error is not changed.
 	if orig.URL != "https://host/botSECRET/getUpdates" || orig.Err != inner {
+		t.Errorf("original *url.Error changed: %+v", orig)
+	}
+}
+
+func TestError_AsInterfaceGetsMaskedURLError(t *testing.T) {
+	orig := &url.Error{Op: "Get", URL: "https://host/botSECRET/getUpdates", Err: errors.New("dial SECRET")}
+	err := Error(fmt.Errorf("failed to get updates: %w", orig), "SECRET")
+
+	var ne net.Error
+	if !errors.As(err, &ne) {
+		t.Fatal("errors.As(err, net.Error) = false, want true")
+	}
+	var timeouter interface{ Timeout() bool }
+	if !errors.As(err, &timeouter) {
+		t.Fatal("errors.As(err, interface{ Timeout() bool }) = false, want true")
+	}
+	for name, got := range map[string]any{"net.Error": ne, "Timeout": timeouter} {
+		u, ok := got.(*url.Error)
+		if !ok {
+			t.Fatalf("%s: got %T, want *url.Error", name, got)
+		}
+		if u == orig {
+			t.Errorf("%s: errors.As gave the original *url.Error, want a masked copy", name)
+		}
+		if strings.Contains(u.Error(), "SECRET") {
+			t.Errorf("%s: text %q holds the secret", name, u.Error())
+		}
+	}
+	if orig.URL != "https://host/botSECRET/getUpdates" {
 		t.Errorf("original *url.Error changed: %+v", orig)
 	}
 }
