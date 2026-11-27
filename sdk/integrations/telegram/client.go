@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const telegramAPIURL = "https://api.telegram.org/bot"
@@ -28,6 +30,13 @@ type Option func(*Client)
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Client) {
 		c.logger = logger
+	}
+}
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) {
+		c.httpClient = hc
 	}
 }
 
@@ -69,27 +78,27 @@ func (c *Client) GetUpdates(ctx context.Context, offset int64, timeout int) ([]*
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to create request: %w", err))
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get updates: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to get updates: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to read response: %w", err))
 	}
 
 	var result GetUpdatesResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to parse response: %w", err))
 	}
 
 	if !result.OK {
-		return nil, fmt.Errorf("telegram API error: %s (code: %d)", result.Description, result.ErrorCode)
+		return nil, c.redactErr(fmt.Errorf("telegram API error: %s (code: %d)", result.Description, result.ErrorCode))
 	}
 
 	return result.Result, nil
@@ -141,28 +150,28 @@ func (c *Client) EditMessage(ctx context.Context, chatID string, messageID int64
 	url := c.baseURL + c.botToken + "/editMessageText"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to create request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to edit message: %w", err)
+		return c.redactErr(fmt.Errorf("failed to edit message: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read response: %w", err)
+		return c.redactErr(fmt.Errorf("failed to read response: %w", err))
 	}
 
 	var result SendMessageResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return fmt.Errorf("failed to parse response: %w", err)
+		return c.redactErr(fmt.Errorf("failed to parse response: %w", err))
 	}
 
 	if !result.OK {
-		return fmt.Errorf("telegram API error: %s (code: %d)", result.Description, result.ErrorCode)
+		return c.redactErr(fmt.Errorf("telegram API error: %s (code: %d)", result.Description, result.ErrorCode))
 	}
 
 	return nil
@@ -187,13 +196,13 @@ func (c *Client) AnswerCallback(ctx context.Context, callbackID, text string) er
 	url := c.baseURL + c.botToken + "/answerCallbackQuery"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to create request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to answer callback: %w", err)
+		return c.redactErr(fmt.Errorf("failed to answer callback: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -210,29 +219,36 @@ func (c *Client) doSend(ctx context.Context, endpoint string, payload interface{
 	url := c.baseURL + c.botToken + endpoint
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to create request: %w", err))
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send message: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to send message: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to read response: %w", err))
 	}
 
 	var result SendMessageResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to parse response: %w", err))
 	}
 
 	if !result.OK {
-		return nil, fmt.Errorf("telegram API error: %s (code: %d)", result.Description, result.ErrorCode)
+		return nil, c.redactErr(fmt.Errorf("telegram API error: %s (code: %d)", result.Description, result.ErrorCode))
 	}
 
 	return &result, nil
+}
+
+// redactErr masks the bot token in err. The token is part of each request URL,
+// so a transport error (*url.Error) and any text that comes from the response
+// can carry it. The returned error still unwraps to err.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.botToken)
 }

@@ -3,14 +3,17 @@ package telegram
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 // newTestServer starts an httptest server and returns it along with a Client
@@ -329,5 +332,53 @@ func TestConfigFields(t *testing.T) {
 	}
 	if len(cfg.AllowedIDs) != 3 {
 		t.Errorf("AllowedIDs len = %d, want 3", len(cfg.AllowedIDs))
+	}
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the bot token and drives the get-updates and send paths through a failing
+// transport and through an echo server that answers 401 and 500. No error
+// text and no captured log line may hold the canary.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+
+	failing := NewClient(testutil.CanaryToken,
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetUpdates(ctx, 0, 1)
+	collect(err)
+	_, err = failing.SendMessage(ctx, "12345", "hi", "")
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(testutil.CanaryToken, srv.URL)
+		_, err := echo.GetUpdates(ctx, 0, 1)
+		collect(err)
+		_, err = echo.SendMessage(ctx, "12345", "hi", "")
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
+}
+
+// TestRedactErr_Unwraps confirms the masked error still unwraps to the cause.
+func TestRedactErr_Unwraps(t *testing.T) {
+	client := NewClient(testutil.CanaryToken,
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := client.GetUpdates(context.Background(), 0, 1)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	if !strings.Contains(err.Error(), redact.Mask) {
+		t.Errorf("error %q does not hold the mask", err)
 	}
 }
