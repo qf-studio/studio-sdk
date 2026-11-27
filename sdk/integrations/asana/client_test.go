@@ -3,8 +3,10 @@ package asana
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/qf-studio/studio-sdk/sdk/testutil"
@@ -712,4 +714,45 @@ func TestClientMethodSignatures(t *testing.T) {
 
 	err = client.Ping(ctx)
 	_ = err
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the access token and drives GetTask and AddComment through a failing
+// transport and through an echo server that answers 401 and 500. No error
+// text and no captured log line may hold the canary. The client returns no
+// APIError value as an error (APIError is not an error type), so there is no
+// such value for errors.As to hand out.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+
+	failing := NewClient(testutil.CanaryToken, testutil.FakeAsanaWorkspaceID,
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetTask(ctx, "123")
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	_, err = failing.AddComment(ctx, "123", "hi")
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(srv.URL, testutil.CanaryToken, testutil.FakeAsanaWorkspaceID)
+		_, err := echo.GetTask(ctx, "123")
+		collect(err)
+		_, err = echo.AddComment(ctx, "123", "hi")
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }

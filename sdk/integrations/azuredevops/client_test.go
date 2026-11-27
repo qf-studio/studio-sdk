@@ -2,9 +2,12 @@ package azuredevops
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -456,4 +459,51 @@ func mustMarshal(t *testing.T, v interface{}) []byte {
 		t.Fatalf("failed to marshal: %v", err)
 	}
 	return b
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the PAT and drives GetWorkItem and AddWorkItemComment (doRequest) and
+// UpdateWorkItem (doRequestWithPatch) through a failing transport and through
+// an echo server that answers 401 and 500. No error text and no captured log
+// line may hold the canary or the base64 form of the basic credential.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+	ops := []PatchOperation{{Op: "add", Path: "/fields/System.Title", Value: "t"}}
+
+	failing := NewClient(testutil.CanaryToken, "org", "proj",
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetWorkItem(ctx, 42)
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	_, err = failing.AddWorkItemComment(ctx, 42, "hi")
+	collect(err)
+	_, err = failing.UpdateWorkItem(ctx, 42, ops)
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(testutil.CanaryToken, "org", "proj", srv.URL)
+		_, err := echo.GetWorkItem(ctx, 42)
+		collect(err)
+		_, err = echo.AddWorkItemComment(ctx, 42, "hi")
+		collect(err)
+		_, err = echo.UpdateWorkItem(ctx, 42, ops)
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
+	basic := base64.StdEncoding.EncodeToString([]byte(":" + testutil.CanaryToken))
+	testutil.AssertNoCanaryLeak(t, basic, texts...)
 }

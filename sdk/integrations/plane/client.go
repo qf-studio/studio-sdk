@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 // Client is a Plane.so REST API client.
@@ -104,7 +106,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -130,7 +132,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, redact.Text(string(respBody), c.apiKey))
 	}
 
 	if result != nil && len(respBody) > 0 {
@@ -140,6 +142,14 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	return nil
+}
+
+// redactErr masks the API key in err. The key is sent in the X-API-Key
+// header, and a transport error can print the request it failed on.
+// errors.Is and errors.As on the returned error keep their results; a
+// *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.apiKey)
 }
 
 // workItemsBase returns the base path for work-items endpoints.

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"testing"
@@ -789,4 +791,43 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.TriggerLabel != "pilot" {
 		t.Errorf("expected default TriggerLabel pilot, got %s", cfg.TriggerLabel)
 	}
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the API key and drives GetWorkItem and AddComment through a failing
+// transport and through an echo server that answers 401 and 500. No error
+// text and no captured log line may hold the canary.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+
+	failing := NewClient("https://api.plane.so", testutil.CanaryToken,
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetWorkItem(ctx, "ws", "proj", "item-1")
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	err = failing.AddComment(ctx, "ws", "proj", "item-1", "<p>hi</p>")
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClient(srv.URL, testutil.CanaryToken)
+		_, err := echo.GetWorkItem(ctx, "ws", "proj", "item-1")
+		collect(err)
+		err = echo.AddComment(ctx, "ws", "proj", "item-1", "<p>hi</p>")
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }
