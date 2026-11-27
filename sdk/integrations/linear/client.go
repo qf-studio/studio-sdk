@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const (
@@ -28,22 +30,24 @@ type Client struct {
 	teamIDCache map[string]string
 }
 
-// NewClient creates a new Linear client.
-func NewClient(apiKey string) *Client {
-	return &Client{
-		apiKey:  apiKey,
-		baseURL: linearAPIURL,
-		httpClient: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		doneStateCache: make(map[string]string),
-		teamIDCache:    make(map[string]string),
+// ClientOption configures the Client.
+type ClientOption func(*Client)
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = hc
 	}
 }
 
+// NewClient creates a new Linear client.
+func NewClient(apiKey string, opts ...ClientOption) *Client {
+	return NewClientWithBaseURL(apiKey, linearAPIURL, opts...)
+}
+
 // NewClientWithBaseURL creates a new Linear client with a custom base URL (for testing).
-func NewClientWithBaseURL(apiKey, baseURL string) *Client {
-	return &Client{
+func NewClientWithBaseURL(apiKey, baseURL string, opts ...ClientOption) *Client {
+	c := &Client{
 		apiKey:  apiKey,
 		baseURL: baseURL,
 		httpClient: &http.Client{
@@ -52,6 +56,10 @@ func NewClientWithBaseURL(apiKey, baseURL string) *Client {
 		doneStateCache: make(map[string]string),
 		teamIDCache:    make(map[string]string),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // Issue represents a Linear issue.
@@ -143,7 +151,7 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -153,7 +161,7 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("API error: %s", string(respBody))
+		return fmt.Errorf("API error: %s", redact.Text(string(respBody), c.apiKey))
 	}
 
 	var gqlResp GraphQLResponse
@@ -162,7 +170,7 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 	}
 
 	if len(gqlResp.Errors) > 0 {
-		return fmt.Errorf("GraphQL error: %s", gqlResp.Errors[0].Message)
+		return fmt.Errorf("GraphQL error: %s", redact.Text(gqlResp.Errors[0].Message, c.apiKey))
 	}
 
 	if result != nil {
@@ -172,6 +180,14 @@ func (c *Client) Execute(ctx context.Context, query string, variables map[string
 	}
 
 	return nil
+}
+
+// redactErr masks the API key in err. The key is sent in the Authorization
+// header, and a transport error can print the request it failed on.
+// errors.Is and errors.As on the returned error keep their results; a
+// *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.apiKey)
 }
 
 // GetIssue fetches an issue by ID.

@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const slackAPIURL = "https://slack.com/api"
@@ -28,6 +30,13 @@ type Option func(*Client)
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Client) {
 		c.logger = logger
+	}
+}
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) Option {
+	return func(c *Client) {
+		c.httpClient = hc
 	}
 }
 
@@ -80,7 +89,7 @@ func (c *Client) PostMessage(ctx context.Context, msg *Message) (*PostMessageRes
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to post message: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to post message: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -95,7 +104,7 @@ func (c *Client) PostMessage(ctx context.Context, msg *Message) (*PostMessageRes
 	}
 
 	if !result.OK {
-		return nil, fmt.Errorf("slack API error: %s", result.Error)
+		return nil, fmt.Errorf("slack API error: %s", redact.Text(result.Error, c.botToken))
 	}
 
 	return &result, nil
@@ -130,7 +139,7 @@ func (c *Client) UpdateMessage(ctx context.Context, channel, ts string, msg *Mes
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to update message: %w", err)
+		return c.redactErr(fmt.Errorf("failed to update message: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -144,7 +153,7 @@ func (c *Client) UpdateMessage(ctx context.Context, channel, ts string, msg *Mes
 	}
 
 	if !result.OK {
-		return fmt.Errorf("slack API error: %s", result.Error)
+		return fmt.Errorf("slack API error: %s", redact.Text(result.Error, c.botToken))
 	}
 
 	return nil
@@ -167,7 +176,7 @@ func (c *Client) PostInteractiveMessage(ctx context.Context, msg *InteractiveMes
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to post message: %w", err)
+		return nil, c.redactErr(fmt.Errorf("failed to post message: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -182,7 +191,7 @@ func (c *Client) PostInteractiveMessage(ctx context.Context, msg *InteractiveMes
 	}
 
 	if !result.OK {
-		return nil, fmt.Errorf("slack API error: %s", result.Error)
+		return nil, fmt.Errorf("slack API error: %s", redact.Text(result.Error, c.botToken))
 	}
 
 	return &result, nil
@@ -217,7 +226,7 @@ func (c *Client) UpdateInteractiveMessage(ctx context.Context, channel, ts strin
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to update message: %w", err)
+		return c.redactErr(fmt.Errorf("failed to update message: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -231,8 +240,16 @@ func (c *Client) UpdateInteractiveMessage(ctx context.Context, channel, ts strin
 	}
 
 	if !result.OK {
-		return fmt.Errorf("slack API error: %s", result.Error)
+		return fmt.Errorf("slack API error: %s", redact.Text(result.Error, c.botToken))
 	}
 
 	return nil
+}
+
+// redactErr masks the bot token in err. The token is sent in the
+// Authorization header, and a transport error can print the request it
+// failed on. errors.Is and errors.As on the returned error keep their
+// results; a *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.botToken)
 }

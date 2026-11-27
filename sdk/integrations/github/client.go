@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const (
@@ -68,6 +70,31 @@ func (e *PartialGraphQLError) Error() string {
 	return "graphql partial error: " + strings.Join(msgs, "; ")
 }
 
+// redactGraphQLErrors returns a copy of errs with token masked in each
+// message, type and string path element.
+func redactGraphQLErrors(errs []GraphQLError, token string) []GraphQLError {
+	if len(errs) == 0 {
+		return errs
+	}
+	out := make([]GraphQLError, len(errs))
+	for i, ge := range errs {
+		ge.Message = redact.Text(ge.Message, token)
+		ge.Type = redact.Text(ge.Type, token)
+		if len(ge.Path) > 0 {
+			path := make([]interface{}, len(ge.Path))
+			for j, p := range ge.Path {
+				if s, ok := p.(string); ok {
+					p = redact.Text(s, token)
+				}
+				path[j] = p
+			}
+			ge.Path = path
+		}
+		out[i] = ge
+	}
+	return out
+}
+
 // isTolerable reports whether a GraphQL error type is a per-node access error
 // safe to skip on a partial board page. Only NOT_FOUND and FORBIDDEN qualify;
 // empty Type, RATE_LIMITED, auth, and syntax errors are all fatal.
@@ -91,8 +118,15 @@ type Client struct {
 	retryOpts       RetryOptions // Retry config for doRequest; overridable in tests
 }
 
-// ClientOption configures a Client created via NewClientWithTokenFunc.
+// ClientOption configures a Client.
 type ClientOption func(*Client)
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = hc
+	}
+}
 
 // WithTokenInvalidate registers a hook that runs once when a request fails
 // with 401 Unauthorized, before the client re-resolves the token via
@@ -116,8 +150,8 @@ func WithClientBaseURL(baseURL string) ClientOption {
 // NewClient creates a new GitHub client for a fixed, one-shot token. Suitable
 // for short-lived processes or PATs; for long-lived daemons under GitHub App
 // auth (installation tokens expire hourly) use NewClientWithTokenFunc instead.
-func NewClient(token string) *Client {
-	return &Client{
+func NewClient(token string, opts ...ClientOption) *Client {
+	c := &Client{
 		token:     token,
 		baseURL:   githubAPIURL,
 		retryOpts: DefaultRetryOptions(),
@@ -125,12 +159,16 @@ func NewClient(token string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // NewClientWithBaseURL creates a new GitHub client with a custom base URL (for testing).
 // Retry is disabled by default so unit tests fail fast; set client.retryOpts to enable.
-func NewClientWithBaseURL(token, baseURL string) *Client {
-	return &Client{
+func NewClientWithBaseURL(token, baseURL string, opts ...ClientOption) *Client {
+	c := &Client{
 		token:     token,
 		baseURL:   baseURL,
 		retryOpts: RetryOptions{MaxRetries: 0},
@@ -138,6 +176,10 @@ func NewClientWithBaseURL(token, baseURL string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // NewClientWithTokenFunc creates a GitHub client that resolves its bearer
@@ -287,7 +329,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 			resp, err := c.httpClient.Do(req)
 			if err != nil {
-				return fmt.Errorf("failed to execute request: %w", err)
+				return redact.Error(fmt.Errorf("failed to execute request: %w", err), token)
 			}
 			defer func() { _ = resp.Body.Close() }()
 
@@ -297,7 +339,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 			}
 
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-				msg := string(respBody)
+				// The response text is masked here, where AuthError and
+				// RateLimitError are built, so a value errors.As hands out
+				// holds no token either.
+				msg := redact.Text(string(respBody), token)
 				if resp.StatusCode == http.StatusUnauthorized {
 					return &AuthError{Message: msg}
 				}
@@ -855,7 +900,7 @@ func (c *Client) GetJobLogs(ctx context.Context, owner, repo string, jobID int64
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to execute request: %w", err)
+		return "", redact.Error(fmt.Errorf("failed to execute request: %w", err), token)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -1045,7 +1090,7 @@ func (c *Client) executeGraphQLCore(ctx context.Context, query string, variables
 
 			resp, err := c.httpClient.Do(req)
 			if err != nil {
-				return fmt.Errorf("graphql request failed: %w", err)
+				return redact.Error(fmt.Errorf("graphql request failed: %w", err), token)
 			}
 			defer func() { _ = resp.Body.Close() }()
 
@@ -1055,16 +1100,19 @@ func (c *Client) executeGraphQLCore(ctx context.Context, query string, variables
 			}
 
 			if resp.StatusCode == http.StatusUnauthorized {
-				return &AuthError{Message: string(respBody)}
+				return &AuthError{Message: redact.Text(string(respBody), token)}
 			}
 			if resp.StatusCode != http.StatusOK {
-				return fmt.Errorf("graphql API error (status %d): %s", resp.StatusCode, string(respBody))
+				return fmt.Errorf("graphql API error (status %d): %s", resp.StatusCode, redact.Text(string(respBody), token))
 			}
 
 			var gqlResp GraphQLResponse
 			if err := json.Unmarshal(respBody, &gqlResp); err != nil {
 				return fmt.Errorf("parse graphql response: %w", err)
 			}
+			// Masked before any error is built from them: the values reach
+			// the caller through *PartialGraphQLError as well.
+			gqlResp.Errors = redactGraphQLErrors(gqlResp.Errors, token)
 
 			if len(gqlResp.Errors) > 0 {
 				// Aggregate ALL errors (message + type + path), not just Errors[0].
