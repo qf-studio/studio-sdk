@@ -69,16 +69,37 @@ func EchoServer(t testing.TB, status int) *httptest.Server {
 	return srv
 }
 
-// ErrText returns the text of the full error chain — err.Error(), which for a
-// chain built with %w holds the text of each wrapped layer. This is the text
-// a host logs or posts. It fails the test for a nil error.
+// ErrText returns the text of the full error chain: the text of err, then the
+// text of each error that Unwrap gives, to the end of the chain. For an error
+// with Unwrap() []error, each branch is walked. The texts are joined with a
+// newline. This is each text a host can log or post, including a host that
+// walks the chain. It fails the test for a nil error.
 func ErrText(t testing.TB, err error) string {
 	t.Helper()
 	if err == nil {
 		t.Fatal("ErrText: nil error")
 		return ""
 	}
-	return err.Error()
+	var texts []string
+	var walk func(error)
+	walk = func(e error) {
+		for e != nil {
+			texts = append(texts, e.Error())
+			switch u := e.(type) {
+			case interface{ Unwrap() []error }:
+				for _, branch := range u.Unwrap() {
+					walk(branch)
+				}
+				return
+			case interface{ Unwrap() error }:
+				e = u.Unwrap()
+			default:
+				return
+			}
+		}
+	}
+	walk(err)
+	return strings.Join(texts, "\n")
 }
 
 // CaptureSlog sets the default slog logger to one that writes to a buffer for

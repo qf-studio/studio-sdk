@@ -248,7 +248,8 @@ func (c *Client) doSend(ctx context.Context, endpoint string, payload interface{
 
 // redactErr masks the bot token in err. The token is part of each request URL,
 // so a transport error (*url.Error) and any text that comes from the response
-// can carry it. The returned error still unwraps to err.
+// can carry it. errors.Is and errors.As on the returned error keep their
+// results; a *url.Error they hand out is masked too.
 func (c *Client) redactErr(err error) error {
 	return redact.Error(err, c.botToken)
 }

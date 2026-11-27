@@ -353,6 +353,11 @@ func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
 		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
 	_, err := failing.GetUpdates(ctx, 0, 1)
 	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
 	_, err = failing.SendMessage(ctx, "12345", "hi", "")
 	collect(err)
 
@@ -369,7 +374,8 @@ func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
 	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }
 
-// TestRedactErr_Unwraps confirms the masked error still unwraps to the cause.
+// TestRedactErr_Unwraps confirms errors.As on the masked error still finds the
+// *url.Error of the cause.
 func TestRedactErr_Unwraps(t *testing.T) {
 	client := NewClient(testutil.CanaryToken,
 		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
