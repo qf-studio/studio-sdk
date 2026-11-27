@@ -17,6 +17,16 @@ jobs:
       - name: Check for realistic secret patterns in tracked files
         run: ./scripts/check-secret-patterns.sh
 
+  adapter-canary:
+    name: Check Adapter Canary Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Self-test the adapter canary gate
+        run: ./scripts/test-check-adapter-canary.sh
+      - name: Check each integration package with an HTTP client has a credential leak test
+        run: ./scripts/check-adapter-canary-tests.sh
+
   build-test:
     runs-on: ubuntu-latest
     steps:
