@@ -2,7 +2,12 @@
 // connector. It depends only on the Go stdlib.
 package redact
 
-import "strings"
+import (
+	"errors"
+	"net/url"
+	"reflect"
+	"strings"
+)
 
 // Mask replaces each secret value in the masked text.
 const Mask = "[REDACTED]"
@@ -20,20 +25,46 @@ func Text(s string, secrets ...string) string {
 }
 
 // Error returns an error whose text is the text of err with each non-empty
-// secret replaced by Mask. The returned error unwraps to err, so errors.Is
-// and errors.As keep to work. A nil err stays nil.
+// secret replaced by Mask. A nil err stays nil.
+//
+// The returned error does not unwrap to err: the text of each cause can still
+// hold the secret, so a host that walks the chain would get it. errors.Is and
+// errors.As on the returned error answer as they would on err. A *url.Error
+// that errors.As hands out, for a *url.Error target or an interface target
+// such as net.Error, is a copy whose URL is masked and whose Err is masked
+// with Error; err itself is not changed.
 func Error(err error, secrets ...string) error {
 	if err == nil {
 		return nil
 	}
-	return &redactedError{msg: Text(err.Error(), secrets...), err: err}
+	return &redactedError{msg: Text(err.Error(), secrets...), err: err, secrets: secrets}
 }
 
 type redactedError struct {
-	msg string
-	err error
+	msg     string
+	err     error
+	secrets []string
 }
 
 func (e *redactedError) Error() string { return e.msg }
 
-func (e *redactedError) Unwrap() error { return e.err }
+// Is reports whether the cause matches target.
+func (e *redactedError) Is(target error) bool { return errors.Is(e.err, target) }
+
+// As finds the first error in the cause chain that matches target. A
+// *url.Error is handed out as a masked copy, whether target points to a
+// *url.Error or to an interface type it satisfies (such as net.Error).
+func (e *redactedError) As(target any) bool {
+	if !errors.As(e.err, target) {
+		return false
+	}
+	// errors.As has checked that target is a non-nil pointer.
+	v := reflect.ValueOf(target).Elem()
+	if u, ok := v.Interface().(*url.Error); ok && u != nil {
+		masked := *u
+		masked.URL = Text(masked.URL, e.secrets...)
+		masked.Err = Error(masked.Err, e.secrets...)
+		v.Set(reflect.ValueOf(&masked))
+	}
+	return true
+}

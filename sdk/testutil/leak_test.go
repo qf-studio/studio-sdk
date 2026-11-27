@@ -141,8 +141,28 @@ func TestLeakHelpers_CarryCredentials(t *testing.T) {
 
 func TestErrText(t *testing.T) {
 	err := fmt.Errorf("outer: %w", fmt.Errorf("middle: %w", errors.New("inner")))
-	if got, want := ErrText(t, err), "outer: middle: inner"; got != want {
+	if got, want := ErrText(t, err), "outer: middle: inner\nmiddle: inner\ninner"; got != want {
 		t.Errorf("ErrText = %q, want %q", got, want)
+	}
+
+	// A layer whose text drops the cause: only the walk of the chain sees it.
+	chain := &opaqueErr{msg: "first", err: &opaqueErr{msg: "second", err: errors.New("third")}}
+	got := ErrText(t, chain)
+	for _, want := range []string{"first", "second", "third"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("ErrText(chain) = %q, does not hold %q", got, want)
+		}
+	}
+
+	joined := &opaqueErr{msg: "top", err: errors.Join(
+		&opaqueErr{msg: "branch-a", err: errors.New("leaf-a")},
+		errors.New("branch-b"),
+	)}
+	got = ErrText(t, joined)
+	for _, want := range []string{"top", "branch-a", "leaf-a", "branch-b"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("ErrText(joined) = %q, does not hold %q", got, want)
+		}
 	}
 
 	rec := &recordingTB{TB: t}
@@ -153,6 +173,16 @@ func TestErrText(t *testing.T) {
 		t.Errorf("ErrText(nil): got %d failures, want 1", len(rec.msgs))
 	}
 }
+
+// opaqueErr wraps err but its text holds only msg, not the text of err.
+type opaqueErr struct {
+	msg string
+	err error
+}
+
+func (e *opaqueErr) Error() string { return e.msg }
+
+func (e *opaqueErr) Unwrap() error { return e.err }
 
 func TestCaptureSlog(t *testing.T) {
 	prev := slog.Default()
