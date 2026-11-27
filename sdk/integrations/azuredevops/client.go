@@ -61,8 +61,8 @@ func NewClient(pat, organization, project string, opts ...ClientOption) *Client 
 }
 
 // NewClientWithConfig creates a new Azure DevOps client from config
-func NewClientWithConfig(config *Config) *Client {
-	c := NewClient(config.PAT, config.Organization, config.Project)
+func NewClientWithConfig(config *Config, opts ...ClientOption) *Client {
+	c := NewClient(config.PAT, config.Organization, config.Project, opts...)
 	if config.Repository != "" {
 		c.repository = config.Repository
 	}
@@ -102,8 +102,12 @@ func (c *Client) basicAuth() string {
 }
 
 // secrets returns each form of the PAT a request carries: the PAT and its
-// base64 basic credential.
+// base64 basic credential. An empty PAT has no secret: its basic credential
+// is base64(":"), and masking that would mask each "Og==" in a response.
 func (c *Client) secrets() []string {
+	if c.pat == "" {
+		return nil
+	}
 	return []string{c.pat, c.basicAuth()}
 }
 
