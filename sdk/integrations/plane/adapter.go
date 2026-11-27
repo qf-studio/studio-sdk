@@ -83,6 +83,9 @@ func (a *Adapter) NewPoller(deps core.PollerDeps) core.Poller {
 			fn(ev)
 		}))
 	}
+	if a.config.CompletedStateAtMerge {
+		opts = append(opts, WithCompletedStateAtMerge())
+	}
 
 	return NewPoller(client, a.config, interval, opts...)
 }

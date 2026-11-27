@@ -8,8 +8,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/qf-studio/studio-sdk/sdk/core"
+	"github.com/qf-studio/studio-sdk/sdk/testutil"
 )
 
 // TestAdapter_NewPoller_BridgesOnPRCreated verifies PollerDeps.OnPRCreated is
@@ -54,6 +56,79 @@ func TestAdapter_NewPoller_BridgesOnPRCreated(t *testing.T) {
 	}
 	if capturedEvent.IssueID != "work-item-10001" {
 		t.Errorf("IssueID = %q, want %q", capturedEvent.IssueID, "work-item-10001")
+	}
+}
+
+// runAdapterPollerCase builds a poller through Adapter.NewPoller with the
+// given CompletedStateAtMerge, runs one work item whose handler returns a
+// successful result with a pull request, and returns the state IDs and the
+// label patches set on the work item.
+func runAdapterPollerCase(t *testing.T, completedStateAtMerge bool) (states []string, patches [][]string) {
+	t.Helper()
+	fake := newFakePlane(t)
+	fake.labels["proj-a"] = projectLabelsFor("a")
+	fake.states["proj-a"] = []State{
+		{ID: "a-started", Name: "In Progress", Group: StateGroupStarted},
+		{ID: "a-completed", Name: "Done", Group: StateGroupCompleted},
+	}
+	fake.items["proj-a"] = []WorkItem{{ID: "wi-1", Name: "One", ProjectID: "proj-a", LabelIDs: []string{"a-pilot"}}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	cfg := DefaultConfig()
+	cfg.Enabled = true
+	cfg.BaseURL = srv.URL
+	cfg.APIKey = testutil.FakePlaneAPIKey
+	cfg.WorkspaceSlug = "ws"
+	cfg.ProjectIDs = []string{"proj-a"}
+	cfg.Polling = &PollingConfig{Enabled: true, Interval: 10 * time.Millisecond}
+	cfg.CompletedStateAtMerge = completedStateAtMerge
+
+	var logs syncBuffer
+	poller := New(cfg).NewPoller(core.PollerDeps{
+		Handler: core.IssueHandlerFunc(func(_ context.Context, _ core.IssueEvent) (*core.IssueResult, error) {
+			return &core.IssueResult{Success: true, PRNumber: 42, PRURL: "https://example.test/pr"}, nil
+		}),
+		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+	})
+	p, ok := poller.(*Poller)
+	if !ok {
+		t.Fatalf("NewPoller returned %T, want *Poller", poller)
+	}
+
+	// The run is finished when the done label is set.
+	err := runPoller(t, p, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return HasLabelID(&fake.items["proj-a"][0], "a-done")
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	// Start waits for the active run, so the last state update is in.
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return append([]string(nil), fake.statePatches["wi-1"]...), append([][]string(nil), fake.patches["wi-1"]...)
+}
+
+// mutation pin: Adapter.NewPoller does not add WithCompletedStateAtMerge when Config.CompletedStateAtMerge is true -> this test fails
+func TestAdapter_NewPoller_CompletedStateAtMerge(t *testing.T) {
+	states, patches := runAdapterPollerCase(t, true)
+
+	if n := countState(states, "a-completed"); n != 0 {
+		t.Errorf("completed state requests = %d (states %v), want 0", n, states)
+	}
+	if len(patches) == 0 || strings.Join(patches[len(patches)-1], ",") != "a-pilot,a-done" {
+		t.Errorf("label patches = %v, want the last one to add the done label", patches)
+	}
+}
+
+// mutation pin: Adapter.NewPoller adds WithCompletedStateAtMerge when Config.CompletedStateAtMerge is false -> this test fails
+func TestAdapter_NewPoller_CompletedStateDefault(t *testing.T) {
+	states, _ := runAdapterPollerCase(t, false)
+
+	if n := countState(states, "a-completed"); n != 1 {
+		t.Errorf("completed state requests = %d (states %v), want 1", n, states)
 	}
 }
 
