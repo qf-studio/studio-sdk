@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,27 +86,25 @@ func runAdapterPollerCase(t *testing.T, completedStateAtMerge bool) (states []st
 	cfg.CompletedStateAtMerge = completedStateAtMerge
 
 	var logs syncBuffer
+	var prCreated atomic.Int32
 	poller := New(cfg).NewPoller(core.PollerDeps{
 		Handler: core.IssueHandlerFunc(func(_ context.Context, _ core.IssueEvent) (*core.IssueResult, error) {
 			return &core.IssueResult{Success: true, PRNumber: 42, PRURL: "https://example.test/pr"}, nil
 		}),
-		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+		OnPRCreated: func(core.PRCreatedEvent) { prCreated.Add(1) },
+		Logger:      slog.New(slog.NewTextHandler(&logs, nil)),
 	})
 	p, ok := poller.(*Poller)
 	if !ok {
 		t.Fatalf("NewPoller returned %T, want *Poller", poller)
 	}
 
-	// The run is finished when the done label is set.
-	err := runPoller(t, p, func() bool {
-		fake.mu.Lock()
-		defer fake.mu.Unlock()
-		return HasLabelID(&fake.items["proj-a"][0], "a-done")
-	})
+	// OnPRCreated fires after the completed-state update in processIssueAsync,
+	// so the cancel of Start does not cut the update off.
+	err := runPoller(t, p, func() bool { return prCreated.Load() > 0 })
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	// Start waits for the active run, so the last state update is in.
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	return append([]string(nil), fake.statePatches["wi-1"]...), append([][]string(nil), fake.patches["wi-1"]...)

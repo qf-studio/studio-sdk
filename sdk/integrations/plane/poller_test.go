@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -574,6 +576,14 @@ func TestPollerWarnsOnceForEachKindOfLabelLookupFailure(t *testing.T) {
 // number of OnPRCreated calls.
 func runCompletedStateCase(t *testing.T, prNumber int, opts ...PollerOption) (states []string, patches [][]string, prCreated int) {
 	t.Helper()
+	return runCompletedStateCaseWithDelay(t, prNumber, 0, opts...)
+}
+
+// runCompletedStateCaseWithDelay is runCompletedStateCase with a test server
+// that answers the label request for the done label doneLabelDelay late. The
+// done label is set at once; only the answer waits.
+func runCompletedStateCaseWithDelay(t *testing.T, prNumber int, doneLabelDelay time.Duration, opts ...PollerOption) (states []string, patches [][]string, prCreated int) {
+	t.Helper()
 	fake := newFakePlane(t)
 	fake.labels["proj-a"] = projectLabelsFor("a")
 	fake.states["proj-a"] = []State{
@@ -581,7 +591,11 @@ func runCompletedStateCase(t *testing.T, prNumber int, opts ...PollerOption) (st
 		{ID: "a-completed", Name: "Done", Group: StateGroupCompleted},
 	}
 	fake.items["proj-a"] = []WorkItem{{ID: "wi-1", Name: "One", ProjectID: "proj-a", LabelIDs: []string{"a-pilot"}}}
-	srv := httptest.NewServer(fake)
+	var handler http.Handler = fake
+	if doneLabelDelay > 0 {
+		handler = delayDoneLabel(fake, "a-done", doneLabelDelay)
+	}
+	srv := httptest.NewServer(handler)
 	defer srv.Close()
 
 	var logs syncBuffer
@@ -603,21 +617,53 @@ func runCompletedStateCase(t *testing.T, prNumber int, opts ...PollerOption) (st
 	}, opts...)
 	p := NewPoller(client, cfg, 10*time.Millisecond, opts...)
 
-	// The run is finished when the done label is set.
+	// Wait for a signal that comes after the completed-state update in
+	// processIssueAsync, so the cancel of Start does not cut the update off:
+	// with a pull request OnPRCreated fires last; with none the run always
+	// sends the completed-state update.
 	err := runPoller(t, p, func() bool {
+		if prNumber > 0 {
+			mu.Lock()
+			defer mu.Unlock()
+			return prCreated > 0
+		}
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
-		return HasLabelID(&fake.items["proj-a"][0], "a-done")
+		return countState(fake.statePatches["wi-1"], "a-completed") > 0
 	})
 	if err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	// Start waits for the active run, so the last state update is in.
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
 	mu.Lock()
 	defer mu.Unlock()
 	return append([]string(nil), fake.statePatches["wi-1"]...), append([][]string(nil), fake.patches["wi-1"]...), prCreated
+}
+
+// delayDoneLabel passes each request to next and holds the answer to a PATCH
+// that sets the label doneID for delay, so the request after it starts late.
+func delayDoneLabel(next http.Handler, doneID string, delay time.Duration) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var patch struct {
+			Labels []string `json:"labels"`
+		}
+		_ = json.Unmarshal(body, &patch)
+		if r.Method != http.MethodPatch || !slices.Contains(patch.Labels, doneID) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, r)
+		time.Sleep(delay)
+		for k, v := range rec.Header() {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(rec.Code)
+		_, _ = w.Write(rec.Body.Bytes())
+	})
 }
 
 func countState(states []string, id string) int {
@@ -670,6 +716,18 @@ func TestPollerCompletedStateAtMerge_NoPRStillCompletes(t *testing.T) {
 
 func TestPollerCompletedStateDefault_Unchanged(t *testing.T) {
 	states, _, prCreated := runCompletedStateCase(t, 42)
+
+	if n := countState(states, "a-completed"); n != 1 {
+		t.Errorf("completed state requests = %d (states %v), want 1", n, states)
+	}
+	if prCreated != 1 {
+		t.Errorf("OnPRCreated calls = %d, want 1", prCreated)
+	}
+}
+
+// mutation pin: the helper cancels at the done label -> this test fails
+func TestPollerCompletedState_SlowStateUpdateIsCounted(t *testing.T) {
+	states, _, prCreated := runCompletedStateCaseWithDelay(t, 42, 100*time.Millisecond)
 
 	if n := countState(states, "a-completed"); n != 1 {
 		t.Errorf("completed state requests = %d (states %v), want 1", n, states)
