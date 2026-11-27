@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const (
@@ -90,7 +92,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -100,7 +102,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, redact.Text(string(respBody), c.token))
 	}
 
 	if result != nil && len(respBody) > 0 {
@@ -110,6 +112,14 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	return nil
+}
+
+// redactErr masks the private token in err. The token is sent in the
+// PRIVATE-TOKEN header, and a transport error can print the request it
+// failed on. errors.Is and errors.As on the returned error keep their
+// results; a *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.token)
 }
 
 // GetProject fetches project info

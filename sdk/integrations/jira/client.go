@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 // Client is a Jira API client.
@@ -22,10 +24,20 @@ type Client struct {
 	retryOpts  RetryOptions // Retry config for doRequest; overridable in tests
 }
 
+// ClientOption configures the Client.
+type ClientOption func(*Client)
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = hc
+	}
+}
+
 // NewClient creates a new Jira client.
-func NewClient(baseURL, username, apiToken, platform string) *Client {
+func NewClient(baseURL, username, apiToken, platform string, opts ...ClientOption) *Client {
 	baseURL = strings.TrimSuffix(baseURL, "/")
-	return &Client{
+	c := &Client{
 		baseURL:   baseURL,
 		username:  username,
 		apiToken:  apiToken,
@@ -35,6 +47,10 @@ func NewClient(baseURL, username, apiToken, platform string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // apiPath returns the correct API path based on platform.
@@ -43,6 +59,25 @@ func (c *Client) apiPath() string {
 		return "/rest/api/3"
 	}
 	return "/rest/api/2"
+}
+
+// basicAuth returns the base64 basic credential of the username and API token.
+func (c *Client) basicAuth() string {
+	return base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.apiToken))
+}
+
+// secrets returns each form of the API token a request carries: the token and
+// the base64 basic credential.
+func (c *Client) secrets() []string {
+	return []string{c.apiToken, c.basicAuth()}
+}
+
+// redactErr masks the API token and the basic credential in err. Both are
+// sent in the Authorization header, and a transport error can print the
+// request it failed on. errors.Is and errors.As on the returned error keep
+// their results; a *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.secrets()...)
 }
 
 // doRequest performs an HTTP request to the Jira API with automatic retry on
@@ -70,8 +105,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 			return fmt.Errorf("failed to create request: %w", err)
 		}
 
-		auth := base64.StdEncoding.EncodeToString([]byte(c.username + ":" + c.apiToken))
-		req.Header.Set("Authorization", "Basic "+auth)
+		req.Header.Set("Authorization", "Basic "+c.basicAuth())
 		req.Header.Set("Accept", "application/json")
 		if bodyBytes != nil {
 			req.Header.Set("Content-Type", "application/json")
@@ -79,7 +113,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return fmt.Errorf("failed to execute request: %w", err)
+			return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -89,7 +123,10 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			msg := string(respBody)
+			// The response text is masked here, where AuthError and
+			// RateLimitError are built, so a value errors.As hands out
+			// holds no credential either.
+			msg := redact.Text(string(respBody), c.secrets()...)
 			switch resp.StatusCode {
 			case http.StatusUnauthorized, http.StatusForbidden:
 				return &AuthError{StatusCode: resp.StatusCode, Message: msg}

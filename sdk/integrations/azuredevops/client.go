@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const (
@@ -30,9 +32,19 @@ type Client struct {
 	baseURL      string
 }
 
+// ClientOption configures the Client.
+type ClientOption func(*Client)
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = hc
+	}
+}
+
 // NewClient creates a new Azure DevOps client
-func NewClient(pat, organization, project string) *Client {
-	return &Client{
+func NewClient(pat, organization, project string, opts ...ClientOption) *Client {
+	c := &Client{
 		pat:          pat,
 		organization: organization,
 		project:      project,
@@ -42,6 +54,10 @@ func NewClient(pat, organization, project string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // NewClientWithConfig creates a new Azure DevOps client from config
@@ -57,8 +73,8 @@ func NewClientWithConfig(config *Config) *Client {
 }
 
 // NewClientWithBaseURL creates a new Azure DevOps client with a custom base URL (for testing)
-func NewClientWithBaseURL(pat, organization, project, baseURL string) *Client {
-	return &Client{
+func NewClientWithBaseURL(pat, organization, project, baseURL string, opts ...ClientOption) *Client {
+	c := &Client{
 		pat:          pat,
 		organization: organization,
 		project:      project,
@@ -68,11 +84,35 @@ func NewClientWithBaseURL(pat, organization, project, baseURL string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // SetRepository sets the repository name (if different from project)
 func (c *Client) SetRepository(repo string) {
 	c.repository = repo
+}
+
+// basicAuth returns the base64 basic credential: Azure DevOps uses Basic auth
+// with an empty username and the PAT as password.
+func (c *Client) basicAuth() string {
+	return base64.StdEncoding.EncodeToString([]byte(":" + c.pat))
+}
+
+// secrets returns each form of the PAT a request carries: the PAT and its
+// base64 basic credential.
+func (c *Client) secrets() []string {
+	return []string{c.pat, c.basicAuth()}
+}
+
+// redactErr masks the PAT and its basic credential in err. Both helpers send
+// the credential in the Authorization header, and a transport error can print
+// the request it failed on. errors.Is and errors.As on the returned error keep
+// their results; a *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.secrets()...)
 }
 
 // doRequest performs an HTTP request to the Azure DevOps API
@@ -92,9 +132,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Azure DevOps uses Basic auth with empty username and PAT as password
-	auth := base64.StdEncoding.EncodeToString([]byte(":" + c.pat))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("Authorization", "Basic "+c.basicAuth())
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -102,7 +140,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -112,7 +150,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, redact.Text(string(respBody), c.secrets()...))
 	}
 
 	if result != nil && len(respBody) > 0 {
@@ -141,14 +179,13 @@ func (c *Client) doRequestWithPatch(ctx context.Context, path string, body inter
 		return fmt.Errorf("failed to create request: %w", err)
 	}
 
-	auth := base64.StdEncoding.EncodeToString([]byte(":" + c.pat))
-	req.Header.Set("Authorization", "Basic "+auth)
+	req.Header.Set("Authorization", "Basic "+c.basicAuth())
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json-patch+json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -158,7 +195,7 @@ func (c *Client) doRequestWithPatch(ctx context.Context, path string, body inter
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("API error (status %d): %s", resp.StatusCode, redact.Text(string(respBody), c.secrets()...))
 	}
 
 	if result != nil && len(respBody) > 0 {

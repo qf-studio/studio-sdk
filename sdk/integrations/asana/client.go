@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/qf-studio/studio-sdk/sdk/util/text/redact"
 )
 
 const (
@@ -23,9 +25,19 @@ type Client struct {
 	httpClient  *http.Client
 }
 
+// ClientOption configures the Client.
+type ClientOption func(*Client)
+
+// WithHTTPClient overrides the default HTTP client.
+func WithHTTPClient(hc *http.Client) ClientOption {
+	return func(c *Client) {
+		c.httpClient = hc
+	}
+}
+
 // NewClient creates a new Asana client.
-func NewClient(accessToken, workspaceID string) *Client {
-	return &Client{
+func NewClient(accessToken, workspaceID string, opts ...ClientOption) *Client {
+	c := &Client{
 		baseURL:     BaseURL,
 		accessToken: accessToken,
 		workspaceID: workspaceID,
@@ -33,11 +45,15 @@ func NewClient(accessToken, workspaceID string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // NewClientWithBaseURL creates a new Asana client with a custom base URL (for testing).
-func NewClientWithBaseURL(baseURL, accessToken, workspaceID string) *Client {
-	return &Client{
+func NewClientWithBaseURL(baseURL, accessToken, workspaceID string, opts ...ClientOption) *Client {
+	c := &Client{
 		baseURL:     strings.TrimSuffix(baseURL, "/"),
 		accessToken: accessToken,
 		workspaceID: workspaceID,
@@ -45,6 +61,10 @@ func NewClientWithBaseURL(baseURL, accessToken, workspaceID string) *Client {
 			Timeout: 30 * time.Second,
 		},
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}, result interface{}) error {
@@ -71,7 +91,7 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to execute request: %w", err)
+		return c.redactErr(fmt.Errorf("failed to execute request: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
@@ -83,9 +103,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var apiResp APIResponse[interface{}]
 		if err := json.Unmarshal(respBody, &apiResp); err == nil && len(apiResp.Errors) > 0 {
-			return fmt.Errorf("asana API error (status %d): %s", resp.StatusCode, apiResp.Errors[0].Message)
+			return fmt.Errorf("asana API error (status %d): %s", resp.StatusCode, redact.Text(apiResp.Errors[0].Message, c.accessToken))
 		}
-		return fmt.Errorf("asana API error (status %d): %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("asana API error (status %d): %s", resp.StatusCode, redact.Text(string(respBody), c.accessToken))
 	}
 
 	if result != nil && len(respBody) > 0 {
@@ -95,6 +115,14 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 	}
 
 	return nil
+}
+
+// redactErr masks the access token in err. The token is sent in the
+// Authorization header, and a transport error can print the request it
+// failed on. errors.Is and errors.As on the returned error keep their
+// results; a *url.Error they hand out is masked too.
+func (c *Client) redactErr(err error) error {
+	return redact.Error(err, c.accessToken)
 }
 
 // GetTask fetches a task by GID.

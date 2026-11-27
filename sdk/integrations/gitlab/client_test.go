@@ -3,8 +3,10 @@ package gitlab
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -700,4 +702,43 @@ func TestPipelineStatusConstants(t *testing.T) {
 			t.Errorf("constant = %s, want %s", tt.constant, tt.expected)
 		}
 	}
+}
+
+// TestCanary_ClientDoesNotLeakCredential builds the client with the canary as
+// the private token and drives GetIssue and AddIssueNote through a failing
+// transport and through an echo server that answers 401 and 500. No error
+// text and no captured log line may hold the canary.
+func TestCanary_ClientDoesNotLeakCredential(t *testing.T) {
+	logBuf := testutil.CaptureSlog(t)
+	ctx := context.Background()
+	var texts []string
+
+	collect := func(err error) {
+		t.Helper()
+		texts = append(texts, testutil.ErrText(t, err))
+	}
+
+	failing := NewClient(testutil.CanaryToken, "group/project",
+		WithHTTPClient(&http.Client{Transport: testutil.FailingTransport()}))
+	_, err := failing.GetIssue(ctx, 42)
+	collect(err)
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) {
+		t.Fatalf("errors.As(err, *url.Error) = false; err = %v", err)
+	}
+	texts = append(texts, urlErr.Error())
+	_, err = failing.AddIssueNote(ctx, 42, "hi")
+	collect(err)
+
+	for _, status := range []int{http.StatusUnauthorized, http.StatusInternalServerError} {
+		srv := testutil.EchoServer(t, status)
+		echo := NewClientWithBaseURL(testutil.CanaryToken, "group/project", srv.URL)
+		_, err := echo.GetIssue(ctx, 42)
+		collect(err)
+		_, err = echo.AddIssueNote(ctx, 42, "hi")
+		collect(err)
+	}
+
+	texts = append(texts, logBuf.String())
+	testutil.AssertNoCanaryLeak(t, testutil.CanaryToken, texts...)
 }
